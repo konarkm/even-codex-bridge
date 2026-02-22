@@ -184,11 +184,10 @@ export class UiRenderer {
   }
 
   async flushNow() {
-    const { text, contentOffset, contentLength } = this.#composeText();
-    await this.evenBridge.updateText(text, {
-      contentOffset,
-      contentLength,
-    });
+    const { text } = this.#composeText();
+    // We do app-level paging ourselves; keep SDK contentOffset/contentLength unset so
+    // top status lines never disappear due container-level offset clipping.
+    await this.evenBridge.updateText(text);
   }
 
   #appendHistory(role, text) {

@@ -124,8 +124,8 @@ Server -> client:
 - Ring scroll is inverted from the prior behavior in this app.
   - Scroll events page the assistant final-output window.
 - Auto-mute safety policy:
-  - Triggers on backend disconnect/reconnect, device not-wearing, or device in-case.
-  - Auto-resume only occurs when mute reason is `auto` and all conditions recover.
+  - Triggers on backend disconnect/reconnect only.
+  - Auto-resume only occurs when mute reason is `auto` and backend connectivity recovers.
   - Manual mute is never auto-resumed.
 
 ## Notes

@@ -14,7 +14,6 @@ import {
   OS_EVENT_CLICK,
   OS_EVENT_DOUBLE_CLICK,
   compactStatusLabel,
-  computeAutoMuteTrigger,
   mapScrollEventToDelta,
   nextManualMicToggle,
   shouldAutoResume,
@@ -105,22 +104,16 @@ const renderer = new UiRenderer({
 
 let audioUnsubscribe = null;
 let uiEventUnsubscribe = null;
-let deviceStatusUnsubscribe = null;
 let pingTimer = null;
 let pendingSingleClickTimer = null;
 let started = false;
 let cachedDeviceInfo = null;
+let micTransitionQueue = Promise.resolve();
 
 let micState = MIC_LISTENING;
 let muteReason = MUTE_REASON_NONE;
 let focusMode = false;
 let connectionState = CONNECTION_UNKNOWN;
-let deviceFlags = {
-  known: false,
-  connected: true,
-  isWearing: true,
-  isInCase: false,
-};
 
 function sendSessionStop(reason, source) {
   const payload = { reason };
@@ -170,17 +163,23 @@ function updateRendererModeState() {
 }
 
 function getAutoMuteTrigger() {
-  return computeAutoMuteTrigger({
-    connectionState,
-    deviceKnown: deviceFlags.known,
-    deviceConnected: deviceFlags.connected,
-    isWearing: deviceFlags.isWearing,
-    isInCase: deviceFlags.isInCase,
-  });
+  if (
+    connectionState === CONNECTION_RECONNECTING ||
+    connectionState === CONNECTION_DISCONNECTED ||
+    connectionState === CONNECTION_ERROR
+  ) {
+    return 'backend_disconnected';
+  }
+  return null;
 }
 
 async function applyMicStateTransition(nextMicState, nextMuteReason, source) {
-  if (micState === nextMicState && muteReason === nextMuteReason) {
+  if (!started && source !== 'startup') {
+    return false;
+  }
+
+  const shouldForceApply = source === 'startup';
+  if (!shouldForceApply && micState === nextMicState && muteReason === nextMuteReason) {
     return true;
   }
 
@@ -210,25 +209,53 @@ async function applyMicStateTransition(nextMicState, nextMuteReason, source) {
   }
 }
 
+function queueMicTransition(run, source) {
+  micTransitionQueue = micTransitionQueue
+    .catch(() => {
+      // Keep queue alive.
+    })
+    .then(async () => {
+      try {
+        return await run();
+      } catch (error) {
+        logger.error('Queued mic transition failed', {
+          source,
+          message: error?.message || String(error),
+        });
+        return false;
+      }
+    });
+  return micTransitionQueue;
+}
+
 async function evaluateAutoMutePolicy(source) {
   if (!started) return;
 
   const trigger = getAutoMuteTrigger();
   if (trigger) {
     if (micState === MIC_LISTENING) {
-      await applyMicStateTransition(MIC_MUTED, MUTE_REASON_AUTO, `${source}:${trigger}`);
+      await queueMicTransition(
+        () => applyMicStateTransition(MIC_MUTED, MUTE_REASON_AUTO, `${source}:${trigger}`),
+        `${source}:${trigger}`,
+      );
     }
     return;
   }
 
   if (shouldAutoResume({ micState, muteReason, autoMuteTrigger: trigger })) {
-    await applyMicStateTransition(MIC_LISTENING, MUTE_REASON_NONE, `${source}:auto_resume`);
+    await queueMicTransition(
+      () => applyMicStateTransition(MIC_LISTENING, MUTE_REASON_NONE, `${source}:auto_resume`),
+      `${source}:auto_resume`,
+    );
   }
 }
 
 async function toggleMicManually(source) {
   const next = nextManualMicToggle({ micState, muteReason });
-  await applyMicStateTransition(next.micState, next.muteReason, source);
+  await queueMicTransition(
+    () => applyMicStateTransition(next.micState, next.muteReason, source),
+    source,
+  );
 }
 
 function setConnectionState(nextState) {
@@ -239,7 +266,10 @@ function setConnectionState(nextState) {
 async function handleUiEvent(uiEvent) {
   const eventType = Number(uiEvent?.eventType);
   if (!Number.isFinite(eventType)) return;
-  logger.debug('Received ring/ui event', { eventType });
+  logger.debug('Received ring/ui event', {
+    eventType,
+    source: uiEvent?.source || 'unknown',
+  });
 
   if (eventType === OS_EVENT_DOUBLE_CLICK) {
     clearPendingSingleClick();
@@ -253,6 +283,7 @@ async function handleUiEvent(uiEvent) {
     clearPendingSingleClick();
     pendingSingleClickTimer = setTimeout(() => {
       pendingSingleClickTimer = null;
+      logger.info('Applying single-click mic toggle');
       toggleMicManually('ring_click').catch((error) => {
         logger.error('Single-click mic toggle failed', {
           message: error?.message || String(error),
@@ -389,12 +420,6 @@ async function startAssistant() {
   muteReason = MUTE_REASON_NONE;
   focusMode = false;
   connectionState = CONNECTION_UNKNOWN;
-  deviceFlags = {
-    known: false,
-    connected: true,
-    isWearing: true,
-    isInCase: false,
-  };
   updateRendererModeState();
 
   setStatus('Initializing Even bridge...');
@@ -402,16 +427,6 @@ async function startAssistant() {
 
   await evenBridge.init();
   cachedDeviceInfo = await evenBridge.getDeviceInfo();
-  const initialStatus = cachedDeviceInfo?.status;
-  if (initialStatus) {
-    const connectType = String(initialStatus?.connectType || '').toLowerCase();
-    deviceFlags = {
-      known: true,
-      connected: connectType === 'connected',
-      isWearing: typeof initialStatus?.isWearing === 'boolean' ? initialStatus.isWearing : true,
-      isInCase: typeof initialStatus?.isInCase === 'boolean' ? initialStatus.isInCase : false,
-    };
-  }
 
   audioUnsubscribe = evenBridge.subscribeAudio((audioFrame) => {
     if (micState !== MIC_LISTENING) return;
@@ -427,21 +442,6 @@ async function startAssistant() {
       logger.error('UI event handler failed', {
         message: error?.message || String(error),
       });
-    });
-  });
-
-  deviceStatusUnsubscribe = evenBridge.subscribeDeviceStatus((status) => {
-    const connectType = String(status?.connectType || '').toLowerCase();
-    deviceFlags = {
-      known: true,
-      connected: connectType === 'connected',
-      isWearing: typeof status?.isWearing === 'boolean' ? status.isWearing : deviceFlags.isWearing,
-      isInCase: typeof status?.isInCase === 'boolean' ? status.isInCase : deviceFlags.isInCase,
-    };
-
-    logger.debug('Device status changed', deviceFlags);
-    evaluateAutoMutePolicy('device_status').catch(() => {
-      // No-op.
     });
   });
 
@@ -463,18 +463,11 @@ async function startAssistant() {
       }
       uiEventUnsubscribe = null;
     }
-    if (deviceStatusUnsubscribe) {
-      try {
-        deviceStatusUnsubscribe();
-      } catch {
-        // No-op.
-      }
-      deviceStatusUnsubscribe = null;
-    }
     throw new Error('Failed to enable microphone at startup');
   }
 
   started = true;
+  micTransitionQueue = Promise.resolve();
   evaluateAutoMutePolicy('startup').catch(() => {
     // No-op.
   });
@@ -513,15 +506,6 @@ async function stopAssistant() {
       // No-op.
     }
     uiEventUnsubscribe = null;
-  }
-
-  if (deviceStatusUnsubscribe) {
-    try {
-      deviceStatusUnsubscribe();
-    } catch {
-      // No-op.
-    }
-    deviceStatusUnsubscribe = null;
   }
 
   await evenBridge.stopMic();
@@ -571,15 +555,6 @@ function teardownBestEffort() {
       // No-op.
     }
     uiEventUnsubscribe = null;
-  }
-
-  if (deviceStatusUnsubscribe) {
-    try {
-      deviceStatusUnsubscribe();
-    } catch {
-      // No-op.
-    }
-    deviceStatusUnsubscribe = null;
   }
 
   evenBridge.stopMic().catch(() => {

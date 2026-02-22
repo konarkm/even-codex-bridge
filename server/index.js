@@ -196,6 +196,12 @@ wss.on('connection', (ws, req) => {
     },
     onError(payload) {
       state.metrics.lastError = payload?.message || null;
+      logger.warn('Bridge error', {
+        clientId,
+        code: payload?.code || 'unknown',
+        message: payload?.message || null,
+        recoverable: Boolean(payload?.recoverable),
+      });
       send('error', payload);
     },
   };
@@ -322,9 +328,10 @@ wss.on('connection', (ws, req) => {
     });
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reasonBuffer) => {
     closed = true;
     clearInterval(metricsTimer);
+    const reason = Buffer.isBuffer(reasonBuffer) ? reasonBuffer.toString('utf8') : String(reasonBuffer || '');
 
     messageQueue = messageQueue
       .catch(() => {
@@ -338,7 +345,11 @@ wss.on('connection', (ws, req) => {
         }
       })
       .finally(() => {
-        logger.info('Client disconnected', { clientId });
+        logger.info('Client disconnected', {
+          clientId,
+          code,
+          reason: reason || null,
+        });
       });
   });
 

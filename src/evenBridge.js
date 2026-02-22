@@ -1,4 +1,5 @@
 import {
+  OsEventTypeList,
   StartUpPageCreateResult,
   waitForEvenAppBridge,
 } from '@evenrealities/even_hub_sdk';
@@ -29,6 +30,10 @@ export class EvenBridgeController {
     this.lastRenderedText = '';
     this.lastRenderedOffset = 0;
     this.lastRenderedLength = 0;
+    this.audioSubscribers = new Set();
+    this.textSubscribers = new Set();
+    this.uiSubscribers = new Set();
+    this.hubUnsubscribe = null;
   }
 
   async init() {
@@ -88,12 +93,12 @@ export class EvenBridgeController {
       throw new Error('Even bridge not initialized');
     }
 
-    const unsubscribe = this.bridge.onEvenHubEvent((event) => {
-      if (!event?.audioEvent?.audioPcm) return;
-      onAudioFrame(event.audioEvent.audioPcm);
-    });
-
-    return unsubscribe;
+    this.audioSubscribers.add(onAudioFrame);
+    this.#ensureHubListener();
+    return () => {
+      this.audioSubscribers.delete(onAudioFrame);
+      this.#cleanupHubListenerIfIdle();
+    };
   }
 
   subscribeTextEvents(onTextEvent) {
@@ -101,12 +106,12 @@ export class EvenBridgeController {
       throw new Error('Even bridge not initialized');
     }
 
-    const unsubscribe = this.bridge.onEvenHubEvent((event) => {
-      if (!event?.textEvent) return;
-      onTextEvent(event.textEvent);
-    });
-
-    return unsubscribe;
+    this.textSubscribers.add(onTextEvent);
+    this.#ensureHubListener();
+    return () => {
+      this.textSubscribers.delete(onTextEvent);
+      this.#cleanupHubListenerIfIdle();
+    };
   }
 
   subscribeUiEvents(onUiEvent) {
@@ -114,20 +119,12 @@ export class EvenBridgeController {
       throw new Error('Even bridge not initialized');
     }
 
-    const unsubscribe = this.bridge.onEvenHubEvent((event) => {
-      const textEventType = event?.textEvent?.eventType;
-      const sysEventType = event?.sysEvent?.eventType;
-      const eventType = Number.isFinite(Number(textEventType))
-        ? Number(textEventType)
-        : Number.isFinite(Number(sysEventType))
-          ? Number(sysEventType)
-          : null;
-
-      if (eventType == null) return;
-      onUiEvent({ eventType, rawEvent: event });
-    });
-
-    return unsubscribe;
+    this.uiSubscribers.add(onUiEvent);
+    this.#ensureHubListener();
+    return () => {
+      this.uiSubscribers.delete(onUiEvent);
+      this.#cleanupHubListenerIfIdle();
+    };
   }
 
   subscribeDeviceStatus(onDeviceStatus) {
@@ -145,8 +142,15 @@ export class EvenBridgeController {
       throw new Error('Even bridge not initialized');
     }
 
-    const ok = await this.bridge.audioControl(Boolean(enabled));
-    if (!ok) {
+    const desired = Boolean(enabled);
+    const ok = await this.bridge.audioControl(desired);
+    if (ok) return;
+
+    // Some firmware/build combinations can transiently reject mic toggles;
+    // retry once before surfacing a hard failure.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const retryOk = await this.bridge.audioControl(desired);
+    if (!retryOk) {
       throw new Error(`Failed to ${enabled ? 'open' : 'close'} mic via audioControl(${enabled ? 'true' : 'false'})`);
     }
   }
@@ -232,5 +236,77 @@ export class EvenBridgeController {
         },
       ],
     };
+  }
+
+  #ensureHubListener() {
+    if (this.hubUnsubscribe || !this.bridge) return;
+
+    this.hubUnsubscribe = this.bridge.onEvenHubEvent((event) => {
+      if (event?.audioEvent?.audioPcm) {
+        for (const listener of this.audioSubscribers) {
+          try {
+            listener(event.audioEvent.audioPcm);
+          } catch (error) {
+            this.logger?.warn?.('Audio subscriber threw', { message: error?.message || String(error) });
+          }
+        }
+      }
+
+      if (event?.textEvent) {
+        for (const listener of this.textSubscribers) {
+          try {
+            listener(event.textEvent);
+          } catch (error) {
+            this.logger?.warn?.('Text subscriber threw', { message: error?.message || String(error) });
+          }
+        }
+      }
+
+      const uiEvents = [
+        {
+          source: 'textEvent',
+          eventType: OsEventTypeList.fromJson(event?.textEvent?.eventType),
+        },
+        {
+          source: 'listEvent',
+          eventType: OsEventTypeList.fromJson(event?.listEvent?.eventType),
+        },
+        {
+          source: 'sysEvent',
+          eventType: OsEventTypeList.fromJson(event?.sysEvent?.eventType),
+        },
+      ].filter((entry) => entry.eventType != null);
+
+      if (uiEvents.length > 0) {
+        for (const entry of uiEvents) {
+          for (const listener of this.uiSubscribers) {
+            try {
+              listener({
+                eventType: entry.eventType,
+                source: entry.source,
+                rawEvent: event,
+              });
+            } catch (error) {
+              this.logger?.warn?.('UI subscriber threw', { message: error?.message || String(error) });
+            }
+          }
+        }
+      }
+    });
+  }
+
+  #cleanupHubListenerIfIdle() {
+    if (!this.hubUnsubscribe) return;
+
+    if (this.audioSubscribers.size > 0 || this.textSubscribers.size > 0 || this.uiSubscribers.size > 0) {
+      return;
+    }
+
+    try {
+      this.hubUnsubscribe();
+    } catch {
+      // No-op.
+    }
+    this.hubUnsubscribe = null;
   }
 }
