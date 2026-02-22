@@ -50,18 +50,21 @@ export class UiRenderer {
   constructor(options) {
     this.evenBridge = options.evenBridge;
     this.throttleMs = options.throttleMs || 120;
-    this.maxChars = options.maxChars || 1800;
+    this.maxChars = options.maxChars || 1900;
 
     this.statusText = 'Initializing...';
     this.userLiveText = '';
+    this.userLiveUpdatedAt = 0;
+    this.userLiveStaleMs = options.userLiveStaleMs || 1800;
+    this.userLiveExpiryTimer = null;
     this.turnDrafts = new Map();
     this.latestDraftTurnId = null;
     this.history = [];
 
     this.finalAssistantText = '';
     this.finalOffset = 0;
-    this.pageChars = options.pageChars || 480;
-    this.scrollStep = options.scrollStep || 180;
+    this.pageChars = options.pageChars || 900;
+    this.scrollStep = options.scrollStep || 260;
 
     this.pendingTimer = null;
   }
@@ -74,6 +77,11 @@ export class UiRenderer {
 
     this.statusText = 'Initializing...';
     this.userLiveText = '';
+    this.userLiveUpdatedAt = 0;
+    if (this.userLiveExpiryTimer) {
+      clearTimeout(this.userLiveExpiryTimer);
+      this.userLiveExpiryTimer = null;
+    }
     this.turnDrafts.clear();
     this.latestDraftTurnId = null;
     this.history = [];
@@ -101,15 +109,19 @@ export class UiRenderer {
 
   applyTranscriptDelta(payload) {
     const role = payload?.role === 'user' ? 'user' : 'assistant';
-    const chunk = String(payload?.text || '');
+    const chunk = String(payload?.text || '').replace(/\s+/g, ' ').trim();
     const replace = Boolean(payload?.replace);
 
     if (role === 'user') {
+      if (!chunk && !replace) return;
       this.userLiveText = replace ? chunk : mergeDeltaText(this.userLiveText, chunk);
+      this.userLiveUpdatedAt = Date.now();
+      this.#armUserLiveExpiry();
       this.#scheduleRender();
       return;
     }
 
+    if (!chunk && !replace) return;
     const turnId = payload?.turnId || 'turn-unknown';
     const merged = replace ? chunk : mergeDeltaText(this.turnDrafts.get(turnId), chunk);
     this.turnDrafts.set(turnId, merged);
@@ -124,6 +136,11 @@ export class UiRenderer {
 
     if (role === 'user') {
       this.userLiveText = '';
+      this.userLiveUpdatedAt = 0;
+      if (this.userLiveExpiryTimer) {
+        clearTimeout(this.userLiveExpiryTimer);
+        this.userLiveExpiryTimer = null;
+      }
       if (finalText) {
         this.#appendHistory('user', finalText);
       }
@@ -184,6 +201,22 @@ export class UiRenderer {
     }, this.throttleMs);
   }
 
+  #armUserLiveExpiry() {
+    if (this.userLiveExpiryTimer) {
+      clearTimeout(this.userLiveExpiryTimer);
+    }
+
+    const scheduledAt = this.userLiveUpdatedAt;
+    this.userLiveExpiryTimer = setTimeout(() => {
+      this.userLiveExpiryTimer = null;
+      if (!this.userLiveText) return;
+      if (this.userLiveUpdatedAt !== scheduledAt) return;
+      this.userLiveText = '';
+      this.userLiveUpdatedAt = 0;
+      this.#scheduleRender();
+    }, this.userLiveStaleMs);
+  }
+
   #composeText() {
     const lines = [];
 
@@ -193,21 +226,21 @@ export class UiRenderer {
     }
 
     if (this.userLiveText) {
-      lines.push(`[you…] ${this.userLiveText}`);
+      lines.push(`[you] ${this.userLiveText}`);
       lines.push('');
     }
 
     const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
     if (liveDraft) {
-      const liveLines = wrapText(liveDraft, 56);
+      const liveLines = wrapText(liveDraft, 66);
       const visible = liveLines.slice(-2);
       for (const line of visible) {
-        lines.push(`[assistant…] ${line}`);
+        lines.push(`[assistant] ${line}`);
       }
       lines.push('');
     } else if (this.finalAssistantText) {
       const windowText = this.finalAssistantText.slice(this.finalOffset, this.finalOffset + this.pageChars);
-      lines.push('[assistant] ring-scroll enabled');
+      lines.push('[assistant]');
       lines.push(windowText);
 
       if (this.finalAssistantText.length > this.pageChars) {

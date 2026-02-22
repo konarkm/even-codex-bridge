@@ -6,6 +6,14 @@ import {
 const TEXT_CONTAINER_ID = 1;
 const TEXT_CONTAINER_NAME = 'ambient-main';
 const INITIAL_TEXT = 'Starting Codex bridge...';
+// SDK docs define text container ranges:
+// x: 0-576, y: 0-288, width: 0-576, height: 0-288.
+const TEXT_CONTAINER_FRAME = {
+  xPosition: 0,
+  yPosition: 0,
+  width: 576,
+  height: 288,
+};
 
 function normalizeStartResult(raw) {
   if (typeof raw === 'number') return raw;
@@ -181,10 +189,7 @@ export class EvenBridgeController {
       containerTotalNum: 1,
       textObject: [
         {
-          xPosition: 8,
-          yPosition: 8,
-          width: 560,
-          height: 120,
+          ...TEXT_CONTAINER_FRAME,
           containerID: TEXT_CONTAINER_ID,
           containerName: TEXT_CONTAINER_NAME,
           content,
