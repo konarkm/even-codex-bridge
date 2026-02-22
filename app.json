@@ -1,0 +1,25 @@
+{
+  "package_id": "com.example.even-codex-bridge",
+  "edition": "202601",
+  "name": "Codex Bridge",
+  "version": "0.1.0",
+  "min_app_version": "0.1.0",
+  "tagline": "Text-first Codex assistant for Even G2",
+  "description": "Streams mic audio to STT, sends text turns to Codex app-server, and renders replies on glasses.",
+  "author": "Developer",
+  "entrypoint": "index.html",
+  "permissions": {
+    "network": [
+      "evenhub.evenrealities.com",
+      "localhost",
+      "127.0.0.1",
+      "example.com",
+      "*.example.com",
+      "trycloudflare.com",
+      "*.trycloudflare.com"
+    ],
+    "fs": [
+      "./assets"
+    ]
+  }
+}
