@@ -58,6 +58,15 @@ Or both:
 npm run dev
 ```
 
+### Optional simulator autostart (dev-only)
+For simulator/automation loops, you can boot directly into the running assistant:
+- Query flag: `?autostart=1`
+- Env flag: `VITE_AUTO_START=1`
+- Optional query overrides (for ephemeral test sessions): `?ws=<wss-url>&token=<shared-token>&autostart=1`
+
+Example:
+`https://codex-even-app.example.com/?autostart=1`
+
 ## Cloudflared tunnel
 One-time setup for a named tunnel + DNS routes:
 ```bash

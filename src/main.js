@@ -37,6 +37,14 @@ const DEFAULT_WS_URL = import.meta.env.VITE_WS_BASE_URL || '';
 const DEFAULT_TOKEN = import.meta.env.VITE_CLIENT_SHARED_TOKEN || '';
 const TEXT_UPDATE_THROTTLE_MS = Number(import.meta.env.VITE_TEXT_UPDATE_THROTTLE_MS || 120);
 const SINGLE_CLICK_DELAY_MS = 220;
+const queryParams = new URLSearchParams(window.location.search);
+
+function isTruthyParam(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+const AUTO_START = isTruthyParam(import.meta.env.VITE_AUTO_START) || isTruthyParam(queryParams.get('autostart'));
 
 function safeGetItem(key, fallback = '') {
   try {
@@ -54,8 +62,10 @@ function safeSetItem(key, value) {
   }
 }
 
-const storedWsUrl = safeGetItem('ambient_ws_url', DEFAULT_WS_URL);
-const storedToken = safeGetItem('ambient_ws_token', DEFAULT_TOKEN);
+const wsOverride = queryParams.get('ws');
+const tokenOverride = queryParams.get('token');
+const storedWsUrl = wsOverride || safeGetItem('ambient_ws_url', DEFAULT_WS_URL);
+const storedToken = tokenOverride || safeGetItem('ambient_ws_token', DEFAULT_TOKEN);
 
 if (storedWsUrl) els.wsUrl.value = storedWsUrl;
 if (storedToken) els.token.value = storedToken;
@@ -229,6 +239,7 @@ function setConnectionState(nextState) {
 async function handleUiEvent(uiEvent) {
   const eventType = Number(uiEvent?.eventType);
   if (!Number.isFinite(eventType)) return;
+  logger.debug('Received ring/ui event', { eventType });
 
   if (eventType === OS_EVENT_DOUBLE_CLICK) {
     clearPendingSingleClick();
@@ -645,3 +656,14 @@ window.addEventListener('pagehide', (event) => {
 updateRendererModeState();
 setStatus('Ready');
 renderer.setStatus('Ready. Tap Start to connect Codex.');
+
+if (AUTO_START) {
+  setStatus('Auto-starting assistant...');
+  renderer.setStatus('Auto-starting assistant...');
+  startAssistant().catch((error) => {
+    const message = error?.message || String(error);
+    logger.error('Auto-start failed', { message });
+    setStatus(`Auto-start failed: ${message}`);
+    renderer.setStatus(`Auto-start failed: ${message}`);
+  });
+}
