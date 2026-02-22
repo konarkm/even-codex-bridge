@@ -109,22 +109,57 @@ export class EvenBridgeController {
     return unsubscribe;
   }
 
-  async startMic() {
+  subscribeUiEvents(onUiEvent) {
+    if (!this.bridge) {
+      throw new Error('Even bridge not initialized');
+    }
+
+    const unsubscribe = this.bridge.onEvenHubEvent((event) => {
+      const textEventType = event?.textEvent?.eventType;
+      const sysEventType = event?.sysEvent?.eventType;
+      const eventType = Number.isFinite(Number(textEventType))
+        ? Number(textEventType)
+        : Number.isFinite(Number(sysEventType))
+          ? Number(sysEventType)
+          : null;
+
+      if (eventType == null) return;
+      onUiEvent({ eventType, rawEvent: event });
+    });
+
+    return unsubscribe;
+  }
+
+  subscribeDeviceStatus(onDeviceStatus) {
+    if (!this.bridge) {
+      throw new Error('Even bridge not initialized');
+    }
+
+    return this.bridge.onDeviceStatusChanged((status) => {
+      onDeviceStatus(status);
+    });
+  }
+
+  async setMicEnabled(enabled) {
     if (!this.bridge || !this.initialized) {
       throw new Error('Even bridge not initialized');
     }
 
-    const ok = await this.bridge.audioControl(true);
+    const ok = await this.bridge.audioControl(Boolean(enabled));
     if (!ok) {
-      throw new Error('Failed to open mic via audioControl(true)');
+      throw new Error(`Failed to ${enabled ? 'open' : 'close'} mic via audioControl(${enabled ? 'true' : 'false'})`);
     }
+  }
+
+  async startMic() {
+    await this.setMicEnabled(true);
   }
 
   async stopMic() {
     if (!this.bridge || !this.initialized) return;
 
     try {
-      await this.bridge.audioControl(false);
+      await this.setMicEnabled(false);
     } catch {
       // No-op.
     }

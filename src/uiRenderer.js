@@ -1,3 +1,8 @@
+import {
+  MIC_LISTENING,
+  compactStatusLabel,
+} from './uxState.mjs';
+
 export function mergeDeltaText(previous, incoming) {
   const prev = String(previous || '');
   const next = String(incoming || '');
@@ -53,6 +58,9 @@ export class UiRenderer {
     this.maxChars = options.maxChars || 1900;
 
     this.statusText = 'Initializing...';
+    this.micState = options.micState || MIC_LISTENING;
+    this.connectionState = options.connectionState || 'unknown';
+    this.focusMode = false;
     this.userLiveText = '';
     this.userLiveUpdatedAt = 0;
     this.userLiveStaleMs = options.userLiveStaleMs || 1800;
@@ -76,6 +84,9 @@ export class UiRenderer {
     }
 
     this.statusText = 'Initializing...';
+    this.micState = MIC_LISTENING;
+    this.connectionState = 'unknown';
+    this.focusMode = false;
     this.userLiveText = '';
     this.userLiveUpdatedAt = 0;
     if (this.userLiveExpiryTimer) {
@@ -94,17 +105,24 @@ export class UiRenderer {
     this.#scheduleRender();
   }
 
-  handleTextEvent(textEvent) {
-    const eventType = Number(textEvent?.eventType);
-    // OsEventTypeList: SCROLL_TOP_EVENT=1, SCROLL_BOTTOM_EVENT=2
-    if (eventType === 1) {
-      this.#scrollFinal(-this.scrollStep);
-      return;
-    }
-    if (eventType === 2) {
-      this.#scrollFinal(this.scrollStep);
-      return;
-    }
+  setMicState(micState) {
+    this.micState = micState || MIC_LISTENING;
+    this.#scheduleRender();
+  }
+
+  setConnectionState(connectionState) {
+    this.connectionState = connectionState || 'unknown';
+    this.#scheduleRender();
+  }
+
+  setFocusMode(enabled) {
+    this.focusMode = Boolean(enabled);
+    this.#scheduleRender();
+  }
+
+  handleScrollDelta(delta) {
+    if (!Number.isFinite(delta) || delta === 0) return;
+    this.#scrollFinal(delta);
   }
 
   applyTranscriptDelta(payload) {
@@ -218,6 +236,10 @@ export class UiRenderer {
   }
 
   #composeText() {
+    if (this.focusMode) {
+      return this.#composeFocusText();
+    }
+
     const lines = [];
 
     if (this.statusText) {
@@ -263,6 +285,46 @@ export class UiRenderer {
     let output = lines.join('\n').trim();
     if (!output) output = '[status] Waiting for transcript and Codex output...';
 
+    if (output.length > this.maxChars) {
+      output = `...${output.slice(output.length - (this.maxChars - 3))}`;
+    }
+
+    return {
+      text: output,
+      contentOffset: this.finalOffset,
+      contentLength: this.pageChars,
+    };
+  }
+
+  #composeFocusText() {
+    const lines = [];
+    lines.push(`[status] ${compactStatusLabel({ micState: this.micState, connectionState: this.connectionState })}`);
+    lines.push('');
+
+    const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
+    if (liveDraft) {
+      const liveLines = wrapText(liveDraft, 66);
+      const visible = liveLines.slice(-2);
+      for (const line of visible) {
+        lines.push(`[assistant] ${line}`);
+      }
+    } else if (this.finalAssistantText) {
+      const windowText = this.finalAssistantText.slice(this.finalOffset, this.finalOffset + this.pageChars);
+      lines.push('[assistant]');
+      lines.push(windowText);
+
+      if (this.finalAssistantText.length > this.pageChars) {
+        const start = this.finalOffset + 1;
+        const end = Math.min(this.finalAssistantText.length, this.finalOffset + this.pageChars);
+        lines.push('');
+        lines.push(`[${start}-${end} / ${this.finalAssistantText.length}]`);
+      }
+    } else {
+      lines.push('[assistant] Waiting for response...');
+    }
+
+    let output = lines.join('\n').trim();
+    if (!output) output = '[status] listening | initializing';
     if (output.length > this.maxChars) {
       output = `...${output.slice(output.length - (this.maxChars - 3))}`;
     }

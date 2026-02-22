@@ -105,10 +105,19 @@ Server -> client:
 - `pong`: `{ serverTs, clientTs? }`
 
 ## UI behavior
-- Streams live user transcript (`[you…]`).
-- Streams assistant output as two live lines (`[assistant…]`).
-- When assistant final arrives, it is shown in a ring-scrollable window.
-  - Scroll top/bottom events adjust offset and update the final window.
+- `text.submit` (manual prompt box) remains a permanent dev/QA path.
+- Single click (`CLICK_EVENT`) toggles mic state:
+  - `listening` = mic on and STT ingest active.
+  - `muted` = mic off (`audioControl(false)`), STT ingest paused.
+- Double click (`DOUBLE_CLICK_EVENT`) toggles focus mode:
+  - Focus mode shows assistant output + compact status (`listening|muted` + connection state).
+  - Normal mode keeps richer transcript/status context.
+- Ring scroll is inverted from the prior behavior in this app.
+  - Scroll events page the assistant final-output window.
+- Auto-mute safety policy:
+  - Triggers on backend disconnect/reconnect, device not-wearing, or device in-case.
+  - Auto-resume only occurs when mute reason is `auto` and all conditions recover.
+  - Manual mute is never auto-resumed.
 
 ## Notes
 - Codex websocket transport is intentionally not used here; this bridge uses stdio app-server transport.

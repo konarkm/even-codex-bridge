@@ -1,6 +1,25 @@
 import { AudioForwarder } from './audioForwarder.js';
 import { EvenBridgeController } from './evenBridge.js';
 import { UiRenderer } from './uiRenderer.js';
+import {
+  CONNECTION_CONNECTED,
+  CONNECTION_DISCONNECTED,
+  CONNECTION_ERROR,
+  CONNECTION_RECONNECTING,
+  CONNECTION_UNKNOWN,
+  MIC_LISTENING,
+  MIC_MUTED,
+  MUTE_REASON_AUTO,
+  MUTE_REASON_NONE,
+  OS_EVENT_CLICK,
+  OS_EVENT_DOUBLE_CLICK,
+  compactStatusLabel,
+  computeAutoMuteTrigger,
+  mapScrollEventToDelta,
+  nextManualMicToggle,
+  shouldAutoResume,
+  toggleFocusMode,
+} from './uxState.mjs';
 import { WsClient } from './wsClient.js';
 
 const els = {
@@ -17,6 +36,7 @@ const els = {
 const DEFAULT_WS_URL = import.meta.env.VITE_WS_BASE_URL || '';
 const DEFAULT_TOKEN = import.meta.env.VITE_CLIENT_SHARED_TOKEN || '';
 const TEXT_UPDATE_THROTTLE_MS = Number(import.meta.env.VITE_TEXT_UPDATE_THROTTLE_MS || 120);
+const SINGLE_CLICK_DELAY_MS = 220;
 
 function safeGetItem(key, fallback = '') {
   try {
@@ -74,10 +94,23 @@ const renderer = new UiRenderer({
 });
 
 let audioUnsubscribe = null;
-let textEventUnsubscribe = null;
+let uiEventUnsubscribe = null;
+let deviceStatusUnsubscribe = null;
 let pingTimer = null;
+let pendingSingleClickTimer = null;
 let started = false;
 let cachedDeviceInfo = null;
+
+let micState = MIC_LISTENING;
+let muteReason = MUTE_REASON_NONE;
+let focusMode = false;
+let connectionState = CONNECTION_UNKNOWN;
+let deviceFlags = {
+  known: false,
+  connected: true,
+  isWearing: true,
+  isInCase: false,
+};
 
 function sendSessionStop(reason, source) {
   const payload = { reason };
@@ -114,8 +147,119 @@ function stopPingLoop() {
   pingTimer = null;
 }
 
+function clearPendingSingleClick() {
+  if (!pendingSingleClickTimer) return;
+  clearTimeout(pendingSingleClickTimer);
+  pendingSingleClickTimer = null;
+}
+
+function updateRendererModeState() {
+  renderer.setMicState(micState);
+  renderer.setConnectionState(connectionState);
+  renderer.setFocusMode(focusMode);
+}
+
+function getAutoMuteTrigger() {
+  return computeAutoMuteTrigger({
+    connectionState,
+    deviceKnown: deviceFlags.known,
+    deviceConnected: deviceFlags.connected,
+    isWearing: deviceFlags.isWearing,
+    isInCase: deviceFlags.isInCase,
+  });
+}
+
+async function applyMicStateTransition(nextMicState, nextMuteReason, source) {
+  if (micState === nextMicState && muteReason === nextMuteReason) {
+    return true;
+  }
+
+  const shouldEnableMic = nextMicState === MIC_LISTENING;
+  try {
+    await evenBridge.setMicEnabled(shouldEnableMic);
+    micState = nextMicState;
+    muteReason = nextMuteReason;
+    renderer.setMicState(micState);
+    logger.info('Mic state updated', {
+      source,
+      micState,
+      muteReason,
+      compactStatus: compactStatusLabel({ micState, connectionState }),
+    });
+    return true;
+  } catch (error) {
+    const message = error?.message || String(error);
+    logger.error('Failed to toggle mic state', {
+      source,
+      targetState: nextMicState,
+      message,
+    });
+    setStatus('Mic toggle failed');
+    renderer.setStatus('Mic toggle failed');
+    return false;
+  }
+}
+
+async function evaluateAutoMutePolicy(source) {
+  if (!started) return;
+
+  const trigger = getAutoMuteTrigger();
+  if (trigger) {
+    if (micState === MIC_LISTENING) {
+      await applyMicStateTransition(MIC_MUTED, MUTE_REASON_AUTO, `${source}:${trigger}`);
+    }
+    return;
+  }
+
+  if (shouldAutoResume({ micState, muteReason, autoMuteTrigger: trigger })) {
+    await applyMicStateTransition(MIC_LISTENING, MUTE_REASON_NONE, `${source}:auto_resume`);
+  }
+}
+
+async function toggleMicManually(source) {
+  const next = nextManualMicToggle({ micState, muteReason });
+  await applyMicStateTransition(next.micState, next.muteReason, source);
+}
+
+function setConnectionState(nextState) {
+  connectionState = nextState;
+  renderer.setConnectionState(connectionState);
+}
+
+async function handleUiEvent(uiEvent) {
+  const eventType = Number(uiEvent?.eventType);
+  if (!Number.isFinite(eventType)) return;
+
+  if (eventType === OS_EVENT_DOUBLE_CLICK) {
+    clearPendingSingleClick();
+    focusMode = toggleFocusMode(focusMode);
+    renderer.setFocusMode(focusMode);
+    logger.info('Toggled focus mode', { focusMode });
+    return;
+  }
+
+  if (eventType === OS_EVENT_CLICK) {
+    clearPendingSingleClick();
+    pendingSingleClickTimer = setTimeout(() => {
+      pendingSingleClickTimer = null;
+      toggleMicManually('ring_click').catch((error) => {
+        logger.error('Single-click mic toggle failed', {
+          message: error?.message || String(error),
+        });
+      });
+    }, SINGLE_CLICK_DELAY_MS);
+    return;
+  }
+
+  const delta = mapScrollEventToDelta(eventType, renderer.scrollStep, true);
+  if (delta !== 0) {
+    renderer.handleScrollDelta(delta);
+  }
+}
+
 wsClient.addEventListener('open', () => {
   logger.info('WebSocket open');
+  setConnectionState(CONNECTION_CONNECTED);
   setStatus('Connected to backend');
   renderer.setStatus('Connected to backend');
 
@@ -135,6 +279,9 @@ wsClient.addEventListener('open', () => {
   }
 
   beginPingLoop();
+  evaluateAutoMutePolicy('ws_open').catch(() => {
+    // No-op.
+  });
 });
 
 wsClient.addEventListener('close', (event) => {
@@ -145,23 +292,38 @@ wsClient.addEventListener('close', (event) => {
     visibilityState: document.visibilityState,
   });
   stopPingLoop();
+  setConnectionState(CONNECTION_DISCONNECTED);
   setStatus('Backend disconnected');
   renderer.setStatus('Backend disconnected. Reconnecting...');
   if (els.submitBtn) {
     els.submitBtn.disabled = true;
   }
+
+  evaluateAutoMutePolicy('ws_close').catch(() => {
+    // No-op.
+  });
 });
 
 wsClient.addEventListener('reconnecting', (event) => {
   const { attempt, delay } = event.detail;
+  setConnectionState(CONNECTION_RECONNECTING);
   setStatus(`Reconnecting (attempt ${attempt})...`);
   renderer.setStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s`);
+
+  evaluateAutoMutePolicy('ws_reconnecting').catch(() => {
+    // No-op.
+  });
 });
 
 wsClient.addEventListener('error', (event) => {
   logger.error('WebSocket error', event.detail);
+  setConnectionState(CONNECTION_ERROR);
   setStatus(`WebSocket error: ${event.detail.message}`);
   renderer.setStatus(`WebSocket error: ${event.detail.message}`);
+
+  evaluateAutoMutePolicy('ws_error').catch(() => {
+    // No-op.
+  });
 });
 
 wsClient.addEventListener('message', (event) => {
@@ -210,28 +372,104 @@ async function startAssistant() {
   applyConnectionInputs();
   renderer.reset();
   audioForwarder.reset();
+  clearPendingSingleClick();
+
+  micState = MIC_LISTENING;
+  muteReason = MUTE_REASON_NONE;
+  focusMode = false;
+  connectionState = CONNECTION_UNKNOWN;
+  deviceFlags = {
+    known: false,
+    connected: true,
+    isWearing: true,
+    isInCase: false,
+  };
+  updateRendererModeState();
 
   setStatus('Initializing Even bridge...');
   renderer.setStatus('Initializing Even bridge...');
 
   await evenBridge.init();
   cachedDeviceInfo = await evenBridge.getDeviceInfo();
+  const initialStatus = cachedDeviceInfo?.status;
+  if (initialStatus) {
+    const connectType = String(initialStatus?.connectType || '').toLowerCase();
+    deviceFlags = {
+      known: true,
+      connected: connectType === 'connected',
+      isWearing: typeof initialStatus?.isWearing === 'boolean' ? initialStatus.isWearing : true,
+      isInCase: typeof initialStatus?.isInCase === 'boolean' ? initialStatus.isInCase : false,
+    };
+  }
 
   audioUnsubscribe = evenBridge.subscribeAudio((audioFrame) => {
+    if (micState !== MIC_LISTENING) return;
+
     const sent = audioForwarder.forwardFrame(audioFrame);
     if (!sent) {
       logger.debug('Dropped local audio frame while disconnected');
     }
   });
-  textEventUnsubscribe = evenBridge.subscribeTextEvents((textEvent) => {
-    renderer.handleTextEvent(textEvent);
+
+  uiEventUnsubscribe = evenBridge.subscribeUiEvents((uiEvent) => {
+    handleUiEvent(uiEvent).catch((error) => {
+      logger.error('UI event handler failed', {
+        message: error?.message || String(error),
+      });
+    });
   });
 
-  await evenBridge.startMic();
-  renderer.setStatus('Mic active. Connecting backend...');
+  deviceStatusUnsubscribe = evenBridge.subscribeDeviceStatus((status) => {
+    const connectType = String(status?.connectType || '').toLowerCase();
+    deviceFlags = {
+      known: true,
+      connected: connectType === 'connected',
+      isWearing: typeof status?.isWearing === 'boolean' ? status.isWearing : deviceFlags.isWearing,
+      isInCase: typeof status?.isInCase === 'boolean' ? status.isInCase : deviceFlags.isInCase,
+    };
 
-  wsClient.connect();
+    logger.debug('Device status changed', deviceFlags);
+    evaluateAutoMutePolicy('device_status').catch(() => {
+      // No-op.
+    });
+  });
+
+  const micEnabled = await applyMicStateTransition(MIC_LISTENING, MUTE_REASON_NONE, 'startup');
+  if (!micEnabled) {
+    if (audioUnsubscribe) {
+      try {
+        audioUnsubscribe();
+      } catch {
+        // No-op.
+      }
+      audioUnsubscribe = null;
+    }
+    if (uiEventUnsubscribe) {
+      try {
+        uiEventUnsubscribe();
+      } catch {
+        // No-op.
+      }
+      uiEventUnsubscribe = null;
+    }
+    if (deviceStatusUnsubscribe) {
+      try {
+        deviceStatusUnsubscribe();
+      } catch {
+        // No-op.
+      }
+      deviceStatusUnsubscribe = null;
+    }
+    throw new Error('Failed to enable microphone at startup');
+  }
+
   started = true;
+  evaluateAutoMutePolicy('startup').catch(() => {
+    // No-op.
+  });
+
+  renderer.setStatus('Mic active. Connecting backend...');
+  wsClient.connect();
 
   els.connectBtn.disabled = true;
   els.disconnectBtn.disabled = false;
@@ -239,6 +477,9 @@ async function startAssistant() {
 
 async function stopAssistant() {
   if (!started) return;
+
+  started = false;
+  clearPendingSingleClick();
 
   sendSessionStop('user_requested_stop', 'stopAssistant');
 
@@ -253,19 +494,33 @@ async function stopAssistant() {
     }
     audioUnsubscribe = null;
   }
-  if (textEventUnsubscribe) {
+
+  if (uiEventUnsubscribe) {
     try {
-      textEventUnsubscribe();
+      uiEventUnsubscribe();
     } catch {
       // No-op.
     }
-    textEventUnsubscribe = null;
+    uiEventUnsubscribe = null;
+  }
+
+  if (deviceStatusUnsubscribe) {
+    try {
+      deviceStatusUnsubscribe();
+    } catch {
+      // No-op.
+    }
+    deviceStatusUnsubscribe = null;
   }
 
   await evenBridge.stopMic();
   renderer.reset();
 
-  started = false;
+  micState = MIC_LISTENING;
+  muteReason = MUTE_REASON_NONE;
+  focusMode = false;
+  connectionState = CONNECTION_UNKNOWN;
+
   setStatus('Stopped');
   renderer.setStatus('Stopped');
 
@@ -281,6 +536,10 @@ function teardownBestEffort() {
     started,
     visibilityState: document.visibilityState,
   });
+
+  started = false;
+  clearPendingSingleClick();
+
   sendSessionStop('window_unload', 'beforeunload');
   wsClient.disconnect();
   stopPingLoop();
@@ -293,20 +552,29 @@ function teardownBestEffort() {
     }
     audioUnsubscribe = null;
   }
-  if (textEventUnsubscribe) {
+
+  if (uiEventUnsubscribe) {
     try {
-      textEventUnsubscribe();
+      uiEventUnsubscribe();
     } catch {
       // No-op.
     }
-    textEventUnsubscribe = null;
+    uiEventUnsubscribe = null;
+  }
+
+  if (deviceStatusUnsubscribe) {
+    try {
+      deviceStatusUnsubscribe();
+    } catch {
+      // No-op.
+    }
+    deviceStatusUnsubscribe = null;
   }
 
   evenBridge.stopMic().catch(() => {
     // No-op.
   });
   renderer.reset();
-  started = false;
 }
 
 els.connectBtn.addEventListener('click', async () => {
@@ -374,5 +642,6 @@ window.addEventListener('pagehide', (event) => {
   });
 });
 
+updateRendererModeState();
 setStatus('Ready');
 renderer.setStatus('Ready. Tap Start to connect Codex.');
