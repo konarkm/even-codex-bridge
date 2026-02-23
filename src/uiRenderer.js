@@ -16,40 +16,6 @@ export function mergeDeltaText(previous, incoming) {
   return `${prev}${next}`;
 }
 
-function wrapText(text, maxWidth = 56) {
-  const input = String(text || '').replace(/\s+/g, ' ').trim();
-  if (!input) return [];
-
-  const words = input.split(' ');
-  const lines = [];
-  let line = '';
-
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word;
-    if (candidate.length <= maxWidth) {
-      line = candidate;
-      continue;
-    }
-
-    if (line) lines.push(line);
-
-    if (word.length <= maxWidth) {
-      line = word;
-      continue;
-    }
-
-    let remainder = word;
-    while (remainder.length > maxWidth) {
-      lines.push(remainder.slice(0, maxWidth));
-      remainder = remainder.slice(maxWidth);
-    }
-    line = remainder;
-  }
-
-  if (line) lines.push(line);
-  return lines;
-}
-
 export class UiRenderer {
   constructor(options) {
     this.evenBridge = options.evenBridge;
@@ -167,7 +133,21 @@ export class UiRenderer {
     }
 
     if (resolvedText) {
-      this.#appendHistory('assistant', resolvedText);
+      let replacedExisting = false;
+      for (let i = this.history.length - 1; i >= 0; i -= 1) {
+        const item = this.history[i];
+        if (item.role !== 'assistant') continue;
+        if (!item.turnId || item.turnId !== turnId) continue;
+        if (item.text !== resolvedText) {
+          this.history[i] = { ...item, text: resolvedText };
+        }
+        replacedExisting = true;
+        break;
+      }
+
+      if (!replacedExisting) {
+        this.#appendHistory('assistant', resolvedText, { turnId });
+      }
     }
 
     this.#scheduleRender();
@@ -187,8 +167,12 @@ export class UiRenderer {
     });
   }
 
-  #appendHistory(role, text) {
-    this.history.push({ role, text: String(text || '').trim() });
+  #appendHistory(role, text, options = {}) {
+    const entry = { role, text: String(text || '').trim() };
+    if (options.turnId) {
+      entry.turnId = String(options.turnId);
+    }
+    this.history.push(entry);
     if (this.history.length > 24) {
       this.history.splice(0, this.history.length - 24);
     }
@@ -247,29 +231,27 @@ export class UiRenderer {
       return output;
     }
 
-    return `...${output.slice(output.length - (this.maxChars - 3))}`;
+    // Newest-first rendering means keep the head and trim older tail content.
+    return `${output.slice(0, this.maxChars - 3)}...`;
   }
 
   #composeNormalContentText() {
     const lines = [];
 
-    const recent = this.history.slice(-20);
-    for (const item of recent) {
-      const label = item.role === 'user' ? 'you' : 'assistant';
-      lines.push(`[${label}] ${item.text}`);
+    const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
+    if (liveDraft) {
+      lines.push(`[assistant-live] ${liveDraft}`);
     }
 
     if (this.userLiveText) {
       lines.push(`[you-live] ${this.userLiveText}`);
     }
 
-    const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
-    if (liveDraft) {
-      const liveLines = wrapText(liveDraft, 66);
-      const visible = liveLines.slice(-2);
-      for (const line of visible) {
-        lines.push(`[assistant-live] ${line}`);
-      }
+    const recent = this.history.slice(-20);
+    for (let i = recent.length - 1; i >= 0; i -= 1) {
+      const item = recent[i];
+      const label = item.role === 'user' ? 'you' : 'assistant';
+      lines.push(`[${label}] ${item.text}`);
     }
 
     if (lines.length === 0) {
@@ -286,17 +268,14 @@ export class UiRenderer {
       .filter((item) => item.role === 'assistant')
       .slice(-6);
 
-    for (const item of assistantRecent) {
-      lines.push(`[assistant] ${item.text}`);
-    }
-
     const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
     if (liveDraft) {
-      const liveLines = wrapText(liveDraft, 66);
-      const visible = liveLines.slice(-2);
-      for (const line of visible) {
-        lines.push(`[assistant-live] ${line}`);
-      }
+      lines.push(`[assistant-live] ${liveDraft}`);
+    }
+
+    for (let i = assistantRecent.length - 1; i >= 0; i -= 1) {
+      const item = assistantRecent[i];
+      lines.push(`[assistant] ${item.text}`);
     }
 
     if (lines.length === 0) {

@@ -119,6 +119,7 @@ Server -> client:
   - `listening` = mic on and STT ingest active.
   - `muted` = mic off (`audioControl(false)`), STT ingest paused.
 - Web app `Mute Mic` / `Unmute Mic` button mirrors the same mic toggle for manual-text-focused testing.
+  - If `audioControl(false)` is rejected by host firmware, bridge applies a local mute fallback (stops forwarding audio frames to STT).
 - Double click (`DOUBLE_CLICK_EVENT`) toggles focus mode:
   - Focus mode shows assistant output + compact status (`listening|muted` + connection state).
   - Normal mode keeps richer transcript/status context.
@@ -126,6 +127,7 @@ Server -> client:
   - App-side scroll math/windowing is disabled.
   - Scroll events are only logged for diagnostics; no app-level offset/direction transform is applied.
   - The SDK controls direction, paging, and scrollbar behavior.
+- Transcript is rendered newest-first (latest content at top) to align with SDK update behavior during streaming.
 - Transcript text is still capped (`maxChars`) before render to keep updates stable.
   - Older content outside the cap is truncated from the head.
 - Auto-mute safety policy:

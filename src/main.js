@@ -207,6 +207,23 @@ async function applyMicStateTransition(nextMicState, nextMuteReason, source) {
     return true;
   } catch (error) {
     const message = error?.message || String(error);
+    if (nextMicState === MIC_MUTED) {
+      micState = nextMicState;
+      muteReason = nextMuteReason;
+      renderer.setMicState(micState);
+      refreshMicToggleButton();
+      logger.warn('Applied local mic mute fallback after audioControl failure', {
+        source,
+        muteReason,
+        message,
+      });
+      const fallbackStatus = source === 'ring_click' || source === 'web_mic_toggle'
+        ? 'Mic muted (local)'
+        : 'Mic muted (local fallback)';
+      setStatus(fallbackStatus);
+      renderer.setStatus(fallbackStatus);
+      return true;
+    }
     logger.error('Failed to toggle mic state', {
       source,
       targetState: nextMicState,
