@@ -50,10 +50,6 @@ function wrapText(text, maxWidth = 56) {
   return lines;
 }
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
 export class UiRenderer {
   constructor(options) {
     this.evenBridge = options.evenBridge;
@@ -74,14 +70,6 @@ export class UiRenderer {
     this.turnDrafts = new Map();
     this.latestDraftTurnId = null;
     this.history = [];
-
-    this.contentOffset = 0;
-    // Tune to SDK text viewport behavior so ring scroll always has usable range.
-    this.pageChars = options.pageChars || 320;
-    this.scrollStep = options.scrollStep || 90;
-    this.followTail = true;
-    this.lastRenderedContentLength = 0;
-    this.lastRenderedMaxOffset = 0;
 
     this.pendingTimer = null;
   }
@@ -107,10 +95,6 @@ export class UiRenderer {
     this.turnDrafts.clear();
     this.latestDraftTurnId = null;
     this.history = [];
-    this.contentOffset = 0;
-    this.followTail = true;
-    this.lastRenderedContentLength = 0;
-    this.lastRenderedMaxOffset = 0;
   }
 
   setStatus(text) {
@@ -130,27 +114,6 @@ export class UiRenderer {
 
   setFocusMode(enabled) {
     this.focusMode = Boolean(enabled);
-    this.#scheduleRender();
-  }
-
-  handleScrollDelta(delta) {
-    if (!Number.isFinite(delta) || delta === 0) return;
-
-    const maxOffset = Number.isFinite(this.lastRenderedMaxOffset)
-      ? this.lastRenderedMaxOffset
-      : Math.max(0, this.#composeContentText().length - this.pageChars);
-    const baseOffset = this.followTail ? maxOffset : clamp(this.contentOffset, 0, maxOffset);
-    const nextOffset = clamp(baseOffset + delta, 0, maxOffset);
-
-    this.contentOffset = nextOffset;
-    this.followTail = maxOffset === 0 || nextOffset >= maxOffset;
-    this.logger?.debug?.('Renderer handleScrollDelta', {
-      delta,
-      baseOffset,
-      nextOffset,
-      maxOffset,
-      followTail: this.followTail,
-    });
     this.#scheduleRender();
   }
 
@@ -213,44 +176,15 @@ export class UiRenderer {
   async flushNow() {
     const statusText = this.#composeStatusText();
     const contentText = this.#composeContentText();
-    const maxOffset = Math.max(0, contentText.length - this.pageChars);
-
-    if (this.followTail) {
-      this.contentOffset = maxOffset;
-    } else {
-      this.contentOffset = clamp(this.contentOffset, 0, maxOffset);
-    }
-    this.followTail = maxOffset === 0 || this.contentOffset >= maxOffset;
-    this.lastRenderedContentLength = contentText.length;
-    this.lastRenderedMaxOffset = maxOffset;
-
-    const visibleContent = contentText.slice(this.contentOffset, this.contentOffset + this.pageChars);
 
     await this.evenBridge.updateStatus(statusText);
-    await this.evenBridge.updateContent(visibleContent);
+    await this.evenBridge.updateContent(contentText);
 
     this.logger?.debug?.('Renderer flush', {
       statusLength: statusText.length,
       contentLength: contentText.length,
-      visibleLength: visibleContent.length,
-      contentOffset: this.contentOffset,
-      maxOffset,
-      followTail: this.followTail,
       focusMode: this.focusMode,
     });
-  }
-
-  getScrollDebug() {
-    const contentLength = this.lastRenderedContentLength || this.#composeContentText().length;
-    const maxOffset = Number.isFinite(this.lastRenderedMaxOffset)
-      ? this.lastRenderedMaxOffset
-      : Math.max(0, contentLength - this.pageChars);
-    return {
-      contentOffset: this.contentOffset,
-      maxOffset,
-      contentLength,
-      followTail: this.followTail,
-    };
   }
 
   #appendHistory(role, text) {

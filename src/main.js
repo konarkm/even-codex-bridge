@@ -14,7 +14,6 @@ import {
   OS_EVENT_CLICK,
   OS_EVENT_DOUBLE_CLICK,
   compactStatusLabel,
-  mapScrollEventToDelta,
   nextManualMicToggle,
   shouldAutoResume,
   toggleFocusMode,
@@ -26,6 +25,7 @@ const els = {
   token: document.querySelector('#token'),
   connectBtn: document.querySelector('#connect-btn'),
   disconnectBtn: document.querySelector('#disconnect-btn'),
+  micToggleBtn: document.querySelector('#mic-toggle-btn'),
   submitBtn: document.querySelector('#submit-btn'),
   manualText: document.querySelector('#manual-text'),
   status: document.querySelector('#status'),
@@ -37,11 +37,6 @@ const DEFAULT_TOKEN = import.meta.env.VITE_CLIENT_SHARED_TOKEN || '';
 const TEXT_UPDATE_THROTTLE_MS = Number(import.meta.env.VITE_TEXT_UPDATE_THROTTLE_MS || 120);
 const CLICK_SUPPRESS_AFTER_DOUBLE_MS = 400;
 const queryParams = new URLSearchParams(window.location.search);
-const SCROLL_MODE = String(queryParams.get('scroll') || import.meta.env.VITE_SCROLL_MODE || 'normal')
-  .trim()
-  .toLowerCase();
-const NORMALIZED_SCROLL_MODE = SCROLL_MODE === 'normal' ? 'normal' : 'inverted';
-const SCROLL_INVERTED = NORMALIZED_SCROLL_MODE === 'inverted';
 
 function isTruthyParam(value) {
   const normalized = String(value || '').trim().toLowerCase();
@@ -120,6 +115,13 @@ let micState = MIC_LISTENING;
 let muteReason = MUTE_REASON_NONE;
 let focusMode = false;
 let connectionState = CONNECTION_UNKNOWN;
+
+function refreshMicToggleButton() {
+  if (!els.micToggleBtn) return;
+
+  els.micToggleBtn.disabled = !started;
+  els.micToggleBtn.textContent = micState === MIC_MUTED ? 'Unmute Mic' : 'Mute Mic';
+}
 
 function sendSessionStop(reason, source) {
   const payload = { reason };
@@ -201,6 +203,7 @@ async function applyMicStateTransition(nextMicState, nextMuteReason, source) {
       setStatus(ringStatus);
       renderer.setStatus(ringStatus);
     }
+    refreshMicToggleButton();
     return true;
   } catch (error) {
     const message = error?.message || String(error);
@@ -302,18 +305,9 @@ async function handleUiEvent(uiEvent) {
     return;
   }
 
-  const delta = mapScrollEventToDelta(eventType, renderer.scrollStep, SCROLL_INVERTED);
-  if (delta !== 0) {
-    const before = renderer.getScrollDebug?.();
-    renderer.handleScrollDelta(delta);
-    const after = renderer.getScrollDebug?.();
-    logger.debug('Applied scroll event', {
+  if (eventType === 1 || eventType === 2) {
+    logger.debug('Scroll event received (SDK-native paging active; app scroll handler disabled)', {
       eventType,
-      delta,
-      scrollMode: NORMALIZED_SCROLL_MODE,
-      scrollInverted: SCROLL_INVERTED,
-      before,
-      after,
     });
   }
 }
@@ -449,8 +443,6 @@ async function startAssistant() {
   logger.info('Starting assistant with runtime config', {
     wsUrl: wsClient.baseUrl,
     hasToken: Boolean(wsClient.token),
-    scrollMode: NORMALIZED_SCROLL_MODE,
-    scrollInverted: SCROLL_INVERTED,
     textUpdateThrottleMs: TEXT_UPDATE_THROTTLE_MS,
   });
   renderer.reset();
@@ -509,6 +501,7 @@ async function startAssistant() {
   started = true;
   micTransitionQueue = Promise.resolve();
   lastDoubleClickEventAt = 0;
+  refreshMicToggleButton();
   evaluateAutoMutePolicy('startup').catch(() => {
     // No-op.
   });
@@ -556,6 +549,7 @@ async function stopAssistant() {
   muteReason = MUTE_REASON_NONE;
   focusMode = false;
   connectionState = CONNECTION_UNKNOWN;
+  refreshMicToggleButton();
 
   setStatus('Stopped');
   renderer.setStatus('Stopped');
@@ -624,6 +618,22 @@ els.disconnectBtn.addEventListener('click', async () => {
   }
 });
 
+els.micToggleBtn?.addEventListener('click', async () => {
+  if (!started) {
+    setStatus('Start assistant first.');
+    renderer.setStatus('Start assistant first.');
+    return;
+  }
+
+  try {
+    logger.info('Applying web mic toggle');
+    await toggleMicManually('web_mic_toggle');
+  } catch (error) {
+    const message = error?.message || String(error);
+    logger.error('Web mic toggle failed', { message });
+  }
+});
+
 function submitManualText() {
   const text = String(els.manualText?.value || '').trim();
   if (!text) return;
@@ -670,6 +680,7 @@ window.addEventListener('pagehide', (event) => {
 });
 
 updateRendererModeState();
+refreshMicToggleButton();
 setStatus('Ready');
 renderer.setStatus('Ready. Tap Start to connect Codex.');
 

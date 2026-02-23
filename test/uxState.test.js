@@ -126,15 +126,3 @@ test('toggleFocusMode flips boolean state', async () => {
   assert.equal(ux.toggleFocusMode(false), true);
   assert.equal(ux.toggleFocusMode(true), false);
 });
-
-test('mapScrollEventToDelta inverts scroll direction', async () => {
-  const ux = await import('../src/uxState.mjs');
-
-  assert.equal(ux.mapScrollEventToDelta(ux.OS_EVENT_SCROLL_TOP, 100, true), 100);
-  assert.equal(ux.mapScrollEventToDelta(ux.OS_EVENT_SCROLL_BOTTOM, 100, true), -100);
-
-  assert.equal(ux.mapScrollEventToDelta(ux.OS_EVENT_SCROLL_TOP, 100, false), -100);
-  assert.equal(ux.mapScrollEventToDelta(ux.OS_EVENT_SCROLL_BOTTOM, 100, false), 100);
-
-  assert.equal(ux.mapScrollEventToDelta(ux.OS_EVENT_CLICK, 100, true), 0);
-});

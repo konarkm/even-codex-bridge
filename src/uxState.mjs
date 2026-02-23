@@ -16,20 +16,6 @@ export const OS_EVENT_SCROLL_TOP = 1;
 export const OS_EVENT_SCROLL_BOTTOM = 2;
 export const OS_EVENT_DOUBLE_CLICK = 3;
 
-// `SCROLL_TOP_EVENT` (1) is mapped to a negative delta when the client runs in normal mode,
-// meaning the visible transcript pages upward. `SCROLL_BOTTOM_EVENT` (2) goes the other way.
-// `main.js` flips the sign via `SCROLL_INVERTED` whenever `scrollMode` is not `normal`.
-export function mapScrollEventToDelta(eventType, scrollStep, inverted = true) {
-  const step = Math.max(1, Number(scrollStep) || 1);
-  if (eventType === OS_EVENT_SCROLL_TOP) {
-    return inverted ? step : -step;
-  }
-  if (eventType === OS_EVENT_SCROLL_BOTTOM) {
-    return inverted ? -step : step;
-  }
-  return 0;
-}
-
 export function nextManualMicToggle({ micState }) {
   if (micState === MIC_MUTED) {
     return {

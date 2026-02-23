@@ -36,8 +36,6 @@ export class EvenBridgeController {
     this.initialized = false;
     this.lastStatusText = '';
     this.lastContentText = '';
-    this.lastContentOffset = 0;
-    this.lastContentLength = 0;
     this.audioSubscribers = new Set();
     this.textSubscribers = new Set();
     this.uiSubscribers = new Set();
@@ -210,20 +208,11 @@ export class EvenBridgeController {
     this.logger?.warn?.('status textContainerUpgrade failed after rebuild retry');
   }
 
-  async updateContent(text, options = {}) {
+  async updateContent(text) {
     if (!this.bridge || !this.initialized) return;
 
     const content = String(text || '').slice(0, 2000);
-    const hasOffset = Number.isFinite(options.contentOffset);
-    const hasLength = Number.isFinite(options.contentLength);
-    const contentOffset = hasOffset ? Math.max(0, Math.floor(options.contentOffset)) : 0;
-    const contentLength = hasLength ? Math.max(1, Math.floor(options.contentLength)) : content.length;
-
-    if (
-      content === this.lastContentText &&
-      contentOffset === this.lastContentOffset &&
-      contentLength === this.lastContentLength
-    ) {
+    if (content === this.lastContentText) {
       return;
     }
 
@@ -232,18 +221,10 @@ export class EvenBridgeController {
       containerName: CONTENT_CONTAINER_NAME,
       content,
     };
-    if (hasOffset) {
-      updatePayload.contentOffset = contentOffset;
-    }
-    if (hasLength) {
-      updatePayload.contentLength = contentLength;
-    }
 
     const ok = await this.bridge.textContainerUpgrade(updatePayload);
     if (ok) {
       this.lastContentText = content;
-      this.lastContentOffset = contentOffset;
-      this.lastContentLength = contentLength;
       return;
     }
 
@@ -251,16 +232,14 @@ export class EvenBridgeController {
     const retryOk = await this.bridge.textContainerUpgrade(updatePayload);
     if (retryOk) {
       this.lastContentText = content;
-      this.lastContentOffset = contentOffset;
-      this.lastContentLength = contentLength;
       return;
     }
     this.logger?.warn?.('content textContainerUpgrade failed after rebuild retry');
   }
 
-  async updateText(text, options = {}) {
+  async updateText(text) {
     // Backward-compatible helper for older caller paths.
-    await this.updateContent(text, options);
+    await this.updateContent(text);
   }
 
   #buildTextContainers(statusContent, bodyContent) {

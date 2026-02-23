@@ -118,18 +118,16 @@ Server -> client:
 - Single click (`CLICK_EVENT`) toggles mic state:
   - `listening` = mic on and STT ingest active.
   - `muted` = mic off (`audioControl(false)`), STT ingest paused.
+- Web app `Mute Mic` / `Unmute Mic` button mirrors the same mic toggle for manual-text-focused testing.
 - Double click (`DOUBLE_CLICK_EVENT`) toggles focus mode:
   - Focus mode shows assistant output + compact status (`listening|muted` + connection state).
   - Normal mode keeps richer transcript/status context.
-- Ring scroll defaults to inverted mode in this app.
-  - Scroll events page the assistant final-output window.
-  - Smart follow-latest: if you are at the latest position, new content stays in view.
-  - Scrolling away from latest disables follow; follow resumes once you scroll back to the end.
-  - Paging window is computed in app code and only the visible substring is sent to the SDK.
-  - `SCROLL_TOP_EVENT` / `SCROLL_BOTTOM_EVENT` are event-type direction labels from the OS input stream, not explicit "jump to top" / "jump to bottom" commands.
-  - In default mode (`scroll=inverted`), `eventType` 1 (`SCROLL_TOP_EVENT`) maps to a positive delta (newer text) and `eventType` 2 (`SCROLL_BOTTOM_EVENT`) maps to a negative delta (older text).
-  - Set `scroll=normal` (or `VITE_SCROLL_MODE=normal`) to switch back to non-inverted mapping.
-  - Logs from `main.js` (`Applied scroll event`) include event type, delta, and mode (`scrollMode` / `scrollInverted`) so direction issues can be diagnosed from one paste.
+- Ring paging is SDK-native.
+  - App-side scroll math/windowing is disabled.
+  - Scroll events are only logged for diagnostics; no app-level offset/direction transform is applied.
+  - The SDK controls direction, paging, and scrollbar behavior.
+- Transcript text is still capped (`maxChars`) before render to keep updates stable.
+  - Older content outside the cap is truncated from the head.
 - Auto-mute safety policy:
   - Triggers on backend disconnect/reconnect only.
   - Auto-resume only occurs when mute reason is `auto` and backend connectivity recovers.
