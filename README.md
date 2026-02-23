@@ -121,8 +121,15 @@ Server -> client:
 - Double click (`DOUBLE_CLICK_EVENT`) toggles focus mode:
   - Focus mode shows assistant output + compact status (`listening|muted` + connection state).
   - Normal mode keeps richer transcript/status context.
-- Ring scroll is inverted from the prior behavior in this app.
+- Ring scroll defaults to inverted mode in this app.
   - Scroll events page the assistant final-output window.
+  - Smart follow-latest: if you are at the latest position, new content stays in view.
+  - Scrolling away from latest disables follow; follow resumes once you scroll back to the end.
+  - Paging window is computed in app code and only the visible substring is sent to the SDK.
+  - `SCROLL_TOP_EVENT` / `SCROLL_BOTTOM_EVENT` are event-type direction labels from the OS input stream, not explicit "jump to top" / "jump to bottom" commands.
+  - In default mode (`scroll=inverted`), `eventType` 1 (`SCROLL_TOP_EVENT`) maps to a positive delta (newer text) and `eventType` 2 (`SCROLL_BOTTOM_EVENT`) maps to a negative delta (older text).
+  - Set `scroll=normal` (or `VITE_SCROLL_MODE=normal`) to switch back to non-inverted mapping.
+  - Logs from `main.js` (`Applied scroll event`) include event type, delta, and mode (`scrollMode` / `scrollInverted`) so direction issues can be diagnosed from one paste.
 - Auto-mute safety policy:
   - Triggers on backend disconnect/reconnect only.
   - Auto-resume only occurs when mute reason is `auto` and backend connectivity recovers.

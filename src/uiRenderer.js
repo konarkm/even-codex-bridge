@@ -38,7 +38,6 @@ function wrapText(text, maxWidth = 56) {
       continue;
     }
 
-    // Hard-wrap very long tokens.
     let remainder = word;
     while (remainder.length > maxWidth) {
       lines.push(remainder.slice(0, maxWidth));
@@ -51,28 +50,38 @@ function wrapText(text, maxWidth = 56) {
   return lines;
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
 export class UiRenderer {
   constructor(options) {
     this.evenBridge = options.evenBridge;
     this.throttleMs = options.throttleMs || 120;
-    this.maxChars = options.maxChars || 1900;
+    this.maxChars = options.maxChars || 2000;
+    this.logger = options.logger || null;
 
     this.statusText = 'Initializing...';
     this.micState = options.micState || MIC_LISTENING;
     this.connectionState = options.connectionState || 'unknown';
     this.focusMode = false;
+
     this.userLiveText = '';
     this.userLiveUpdatedAt = 0;
     this.userLiveStaleMs = options.userLiveStaleMs || 1800;
     this.userLiveExpiryTimer = null;
+
     this.turnDrafts = new Map();
     this.latestDraftTurnId = null;
     this.history = [];
 
-    this.finalAssistantText = '';
-    this.finalOffset = 0;
-    this.pageChars = options.pageChars || 900;
-    this.scrollStep = options.scrollStep || 260;
+    this.contentOffset = 0;
+    // Tune to SDK text viewport behavior so ring scroll always has usable range.
+    this.pageChars = options.pageChars || 320;
+    this.scrollStep = options.scrollStep || 90;
+    this.followTail = true;
+    this.lastRenderedContentLength = 0;
+    this.lastRenderedMaxOffset = 0;
 
     this.pendingTimer = null;
   }
@@ -87,17 +96,21 @@ export class UiRenderer {
     this.micState = MIC_LISTENING;
     this.connectionState = 'unknown';
     this.focusMode = false;
+
     this.userLiveText = '';
     this.userLiveUpdatedAt = 0;
     if (this.userLiveExpiryTimer) {
       clearTimeout(this.userLiveExpiryTimer);
       this.userLiveExpiryTimer = null;
     }
+
     this.turnDrafts.clear();
     this.latestDraftTurnId = null;
     this.history = [];
-    this.finalAssistantText = '';
-    this.finalOffset = 0;
+    this.contentOffset = 0;
+    this.followTail = true;
+    this.lastRenderedContentLength = 0;
+    this.lastRenderedMaxOffset = 0;
   }
 
   setStatus(text) {
@@ -122,7 +135,23 @@ export class UiRenderer {
 
   handleScrollDelta(delta) {
     if (!Number.isFinite(delta) || delta === 0) return;
-    this.#scrollFinal(delta);
+
+    const maxOffset = Number.isFinite(this.lastRenderedMaxOffset)
+      ? this.lastRenderedMaxOffset
+      : Math.max(0, this.#composeContentText().length - this.pageChars);
+    const baseOffset = this.followTail ? maxOffset : clamp(this.contentOffset, 0, maxOffset);
+    const nextOffset = clamp(baseOffset + delta, 0, maxOffset);
+
+    this.contentOffset = nextOffset;
+    this.followTail = maxOffset === 0 || nextOffset >= maxOffset;
+    this.logger?.debug?.('Renderer handleScrollDelta', {
+      delta,
+      baseOffset,
+      nextOffset,
+      maxOffset,
+      followTail: this.followTail,
+    });
+    this.#scheduleRender();
   }
 
   applyTranscriptDelta(payload) {
@@ -175,8 +204,6 @@ export class UiRenderer {
     }
 
     if (resolvedText) {
-      this.finalAssistantText = resolvedText;
-      this.finalOffset = 0;
       this.#appendHistory('assistant', resolvedText);
     }
 
@@ -184,25 +211,53 @@ export class UiRenderer {
   }
 
   async flushNow() {
-    const { text } = this.#composeText();
-    // We do app-level paging ourselves; keep SDK contentOffset/contentLength unset so
-    // top status lines never disappear due container-level offset clipping.
-    await this.evenBridge.updateText(text);
+    const statusText = this.#composeStatusText();
+    const contentText = this.#composeContentText();
+    const maxOffset = Math.max(0, contentText.length - this.pageChars);
+
+    if (this.followTail) {
+      this.contentOffset = maxOffset;
+    } else {
+      this.contentOffset = clamp(this.contentOffset, 0, maxOffset);
+    }
+    this.followTail = maxOffset === 0 || this.contentOffset >= maxOffset;
+    this.lastRenderedContentLength = contentText.length;
+    this.lastRenderedMaxOffset = maxOffset;
+
+    const visibleContent = contentText.slice(this.contentOffset, this.contentOffset + this.pageChars);
+
+    await this.evenBridge.updateStatus(statusText);
+    await this.evenBridge.updateContent(visibleContent);
+
+    this.logger?.debug?.('Renderer flush', {
+      statusLength: statusText.length,
+      contentLength: contentText.length,
+      visibleLength: visibleContent.length,
+      contentOffset: this.contentOffset,
+      maxOffset,
+      followTail: this.followTail,
+      focusMode: this.focusMode,
+    });
+  }
+
+  getScrollDebug() {
+    const contentLength = this.lastRenderedContentLength || this.#composeContentText().length;
+    const maxOffset = Number.isFinite(this.lastRenderedMaxOffset)
+      ? this.lastRenderedMaxOffset
+      : Math.max(0, contentLength - this.pageChars);
+    return {
+      contentOffset: this.contentOffset,
+      maxOffset,
+      contentLength,
+      followTail: this.followTail,
+    };
   }
 
   #appendHistory(role, text) {
-    this.history.push({ role, text });
-    if (this.history.length > 12) {
-      this.history.splice(0, this.history.length - 12);
+    this.history.push({ role, text: String(text || '').trim() });
+    if (this.history.length > 24) {
+      this.history.splice(0, this.history.length - 24);
     }
-  }
-
-  #scrollFinal(delta) {
-    if (!this.finalAssistantText) return;
-
-    const maxOffset = Math.max(0, this.finalAssistantText.length - this.pageChars);
-    this.finalOffset = Math.min(maxOffset, Math.max(0, this.finalOffset + delta));
-    this.#scheduleRender();
   }
 
   #scheduleRender() {
@@ -234,21 +289,44 @@ export class UiRenderer {
     }, this.userLiveStaleMs);
   }
 
-  #composeText() {
+  #composeStatusText() {
+    const compact = compactStatusLabel({
+      micState: this.micState,
+      connectionState: this.connectionState,
+    });
+
     if (this.focusMode) {
-      return this.#composeFocusText();
+      return compact;
     }
 
+    if (this.statusText) {
+      return `${compact} | ${this.statusText}`.slice(0, 400);
+    }
+
+    return compact;
+  }
+
+  #composeContentText() {
+    const output = this.focusMode ? this.#composeFocusContentText() : this.#composeNormalContentText();
+
+    if (output.length <= this.maxChars) {
+      return output;
+    }
+
+    return `...${output.slice(output.length - (this.maxChars - 3))}`;
+  }
+
+  #composeNormalContentText() {
     const lines = [];
 
-    if (this.statusText) {
-      lines.push(`[status] ${this.statusText}`);
-      lines.push('');
+    const recent = this.history.slice(-20);
+    for (const item of recent) {
+      const label = item.role === 'user' ? 'you' : 'assistant';
+      lines.push(`[${label}] ${item.text}`);
     }
 
     if (this.userLiveText) {
-      lines.push(`[you] ${this.userLiveText}`);
-      lines.push('');
+      lines.push(`[you-live] ${this.userLiveText}`);
     }
 
     const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
@@ -256,82 +334,41 @@ export class UiRenderer {
       const liveLines = wrapText(liveDraft, 66);
       const visible = liveLines.slice(-2);
       for (const line of visible) {
-        lines.push(`[assistant] ${line}`);
-      }
-      lines.push('');
-    } else if (this.finalAssistantText) {
-      const windowText = this.finalAssistantText.slice(this.finalOffset, this.finalOffset + this.pageChars);
-      lines.push('[assistant]');
-      lines.push(windowText);
-
-      if (this.finalAssistantText.length > this.pageChars) {
-        const start = this.finalOffset + 1;
-        const end = Math.min(this.finalAssistantText.length, this.finalOffset + this.pageChars);
-        lines.push('');
-        lines.push(`[${start}-${end} / ${this.finalAssistantText.length}]`);
+        lines.push(`[assistant-live] ${line}`);
       }
     }
 
-    if (!liveDraft && !this.finalAssistantText && this.history.length > 0) {
-      lines.push('');
-      const recent = this.history.slice(-2);
-      for (const item of recent) {
-        const label = item.role === 'user' ? 'you' : 'assistant';
-        lines.push(`[${label}] ${item.text}`);
-      }
+    if (lines.length === 0) {
+      return '[assistant] Waiting for transcript and Codex output...';
     }
 
-    let output = lines.join('\n').trim();
-    if (!output) output = '[status] Waiting for transcript and Codex output...';
-
-    if (output.length > this.maxChars) {
-      output = `...${output.slice(output.length - (this.maxChars - 3))}`;
-    }
-
-    return {
-      text: output,
-      contentOffset: this.finalOffset,
-      contentLength: this.pageChars,
-    };
+    return lines.join('\n\n').trim();
   }
 
-  #composeFocusText() {
+  #composeFocusContentText() {
     const lines = [];
-    lines.push(`[status] ${compactStatusLabel({ micState: this.micState, connectionState: this.connectionState })}`);
-    lines.push('');
+
+    const assistantRecent = this.history
+      .filter((item) => item.role === 'assistant')
+      .slice(-6);
+
+    for (const item of assistantRecent) {
+      lines.push(`[assistant] ${item.text}`);
+    }
 
     const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
     if (liveDraft) {
       const liveLines = wrapText(liveDraft, 66);
       const visible = liveLines.slice(-2);
       for (const line of visible) {
-        lines.push(`[assistant] ${line}`);
+        lines.push(`[assistant-live] ${line}`);
       }
-    } else if (this.finalAssistantText) {
-      const windowText = this.finalAssistantText.slice(this.finalOffset, this.finalOffset + this.pageChars);
-      lines.push('[assistant]');
-      lines.push(windowText);
-
-      if (this.finalAssistantText.length > this.pageChars) {
-        const start = this.finalOffset + 1;
-        const end = Math.min(this.finalAssistantText.length, this.finalOffset + this.pageChars);
-        lines.push('');
-        lines.push(`[${start}-${end} / ${this.finalAssistantText.length}]`);
-      }
-    } else {
-      lines.push('[assistant] Waiting for response...');
     }
 
-    let output = lines.join('\n').trim();
-    if (!output) output = '[status] listening | initializing';
-    if (output.length > this.maxChars) {
-      output = `...${output.slice(output.length - (this.maxChars - 3))}`;
+    if (lines.length === 0) {
+      return '[assistant] Waiting for response...';
     }
 
-    return {
-      text: output,
-      contentOffset: this.finalOffset,
-      contentLength: this.pageChars,
-    };
+    return lines.join('\n\n').trim();
   }
 }

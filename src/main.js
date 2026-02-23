@@ -35,8 +35,13 @@ const els = {
 const DEFAULT_WS_URL = import.meta.env.VITE_WS_BASE_URL || '';
 const DEFAULT_TOKEN = import.meta.env.VITE_CLIENT_SHARED_TOKEN || '';
 const TEXT_UPDATE_THROTTLE_MS = Number(import.meta.env.VITE_TEXT_UPDATE_THROTTLE_MS || 120);
-const SINGLE_CLICK_DELAY_MS = 220;
+const CLICK_SUPPRESS_AFTER_DOUBLE_MS = 400;
 const queryParams = new URLSearchParams(window.location.search);
+const SCROLL_MODE = String(queryParams.get('scroll') || import.meta.env.VITE_SCROLL_MODE || 'normal')
+  .trim()
+  .toLowerCase();
+const NORMALIZED_SCROLL_MODE = SCROLL_MODE === 'normal' ? 'normal' : 'inverted';
+const SCROLL_INVERTED = NORMALIZED_SCROLL_MODE === 'inverted';
 
 function isTruthyParam(value) {
   const normalized = String(value || '').trim().toLowerCase();
@@ -100,15 +105,16 @@ const audioForwarder = new AudioForwarder({ wsClient, logger });
 const renderer = new UiRenderer({
   evenBridge,
   throttleMs: TEXT_UPDATE_THROTTLE_MS,
+  logger,
 });
 
 let audioUnsubscribe = null;
 let uiEventUnsubscribe = null;
 let pingTimer = null;
-let pendingSingleClickTimer = null;
 let started = false;
 let cachedDeviceInfo = null;
 let micTransitionQueue = Promise.resolve();
+let lastDoubleClickEventAt = 0;
 
 let micState = MIC_LISTENING;
 let muteReason = MUTE_REASON_NONE;
@@ -150,12 +156,6 @@ function stopPingLoop() {
   pingTimer = null;
 }
 
-function clearPendingSingleClick() {
-  if (!pendingSingleClickTimer) return;
-  clearTimeout(pendingSingleClickTimer);
-  pendingSingleClickTimer = null;
-}
-
 function updateRendererModeState() {
   renderer.setMicState(micState);
   renderer.setConnectionState(connectionState);
@@ -195,6 +195,12 @@ async function applyMicStateTransition(nextMicState, nextMuteReason, source) {
       muteReason,
       compactStatus: compactStatusLabel({ micState, connectionState }),
     });
+
+    if (source === 'ring_click') {
+      const ringStatus = micState === MIC_MUTED ? 'Mic muted' : 'Mic listening';
+      setStatus(ringStatus);
+      renderer.setStatus(ringStatus);
+    }
     return true;
   } catch (error) {
     const message = error?.message || String(error);
@@ -266,13 +272,18 @@ function setConnectionState(nextState) {
 async function handleUiEvent(uiEvent) {
   const eventType = Number(uiEvent?.eventType);
   if (!Number.isFinite(eventType)) return;
+  const now = Date.now();
+  const rawEvent = uiEvent?.rawEvent || {};
   logger.debug('Received ring/ui event', {
     eventType,
     source: uiEvent?.source || 'unknown',
+    textEventType: rawEvent?.textEvent?.eventType ?? null,
+    listEventType: rawEvent?.listEvent?.eventType ?? null,
+    sysEventType: rawEvent?.sysEvent?.eventType ?? null,
   });
 
   if (eventType === OS_EVENT_DOUBLE_CLICK) {
-    clearPendingSingleClick();
+    lastDoubleClickEventAt = now;
     focusMode = toggleFocusMode(focusMode);
     renderer.setFocusMode(focusMode);
     logger.info('Toggled focus mode', { focusMode });
@@ -280,22 +291,30 @@ async function handleUiEvent(uiEvent) {
   }
 
   if (eventType === OS_EVENT_CLICK) {
-    clearPendingSingleClick();
-    pendingSingleClickTimer = setTimeout(() => {
-      pendingSingleClickTimer = null;
-      logger.info('Applying single-click mic toggle');
-      toggleMicManually('ring_click').catch((error) => {
-        logger.error('Single-click mic toggle failed', {
-          message: error?.message || String(error),
-        });
+    if (now - lastDoubleClickEventAt < CLICK_SUPPRESS_AFTER_DOUBLE_MS) {
+      logger.debug('Suppressed click because it is adjacent to a double-click', {
+        sinceMs: now - lastDoubleClickEventAt,
       });
-    }, SINGLE_CLICK_DELAY_MS);
+      return;
+    }
+    logger.info('Applying single-click mic toggle');
+    await toggleMicManually('ring_click');
     return;
   }
 
-  const delta = mapScrollEventToDelta(eventType, renderer.scrollStep, true);
+  const delta = mapScrollEventToDelta(eventType, renderer.scrollStep, SCROLL_INVERTED);
   if (delta !== 0) {
+    const before = renderer.getScrollDebug?.();
     renderer.handleScrollDelta(delta);
+    const after = renderer.getScrollDebug?.();
+    logger.debug('Applied scroll event', {
+      eventType,
+      delta,
+      scrollMode: NORMALIZED_SCROLL_MODE,
+      scrollInverted: SCROLL_INVERTED,
+      before,
+      after,
+    });
   }
 }
 
@@ -379,14 +398,29 @@ wsClient.addEventListener('message', (event) => {
       const rollover = msg.payload?.rolloverInSec;
       const suffix = rollover != null ? ` (rollover in ${rollover}s)` : '';
       const text = `${phase}${detail}${suffix}`;
+      logger.debug('Received status update', {
+        phase,
+        detail: msg.payload?.detail || null,
+      });
       setStatus(text);
       renderer.setStatus(text);
       break;
     }
     case 'transcript.delta':
+      logger.debug('Received transcript.delta', {
+        role: msg.payload?.role || 'assistant',
+        turnId: msg.payload?.turnId || null,
+        textLength: String(msg.payload?.text || '').length,
+        replace: Boolean(msg.payload?.replace),
+      });
       renderer.applyTranscriptDelta(msg.payload);
       break;
     case 'transcript.final':
+      logger.debug('Received transcript.final', {
+        role: msg.payload?.role || 'assistant',
+        turnId: msg.payload?.turnId || null,
+        textLength: String(msg.payload?.text || '').length,
+      });
       renderer.applyTranscriptFinal(msg.payload);
       break;
     case 'metrics':
@@ -412,9 +446,15 @@ async function startAssistant() {
   if (started) return;
 
   applyConnectionInputs();
+  logger.info('Starting assistant with runtime config', {
+    wsUrl: wsClient.baseUrl,
+    hasToken: Boolean(wsClient.token),
+    scrollMode: NORMALIZED_SCROLL_MODE,
+    scrollInverted: SCROLL_INVERTED,
+    textUpdateThrottleMs: TEXT_UPDATE_THROTTLE_MS,
+  });
   renderer.reset();
   audioForwarder.reset();
-  clearPendingSingleClick();
 
   micState = MIC_LISTENING;
   muteReason = MUTE_REASON_NONE;
@@ -468,6 +508,7 @@ async function startAssistant() {
 
   started = true;
   micTransitionQueue = Promise.resolve();
+  lastDoubleClickEventAt = 0;
   evaluateAutoMutePolicy('startup').catch(() => {
     // No-op.
   });
@@ -483,7 +524,7 @@ async function stopAssistant() {
   if (!started) return;
 
   started = false;
-  clearPendingSingleClick();
+  lastDoubleClickEventAt = 0;
 
   sendSessionStop('user_requested_stop', 'stopAssistant');
 
@@ -533,7 +574,7 @@ function teardownBestEffort() {
   });
 
   started = false;
-  clearPendingSingleClick();
+  lastDoubleClickEventAt = 0;
 
   sendSessionStop('window_unload', 'beforeunload');
   wsClient.disconnect();
