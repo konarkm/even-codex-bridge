@@ -21,6 +21,7 @@ function mergeDeltaText(previous, incoming) {
 }
 
 const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+const SPARK_SUPPORTED_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
 
 function normalizeReasoningEffort(value) {
   const normalized = String(value || '').trim().toLowerCase();
@@ -1026,9 +1027,21 @@ class CodexSessionBridge {
   #getEffortForModel(model) {
     const normalizedModel = normalizeModel(model);
     if (!normalizedModel) return 'medium';
-    const saved = normalizeReasoningEffort(this.effortByModel[normalizedModel]);
-    if (saved) return saved;
-    return normalizedModel === this.fastModel ? 'xhigh' : 'medium';
+    const savedRaw = this.effortByModel[normalizedModel];
+    const saved = this.#coerceEffortForModel(normalizedModel, savedRaw);
+    if (saved) {
+      if (savedRaw !== saved) {
+        this.effortByModel[normalizedModel] = saved;
+        this.#persistModelState();
+        this.logger?.warn?.('effort_clamped_for_model', {
+          model: normalizedModel,
+          requested: String(savedRaw),
+          resolved: saved,
+        });
+      }
+      return saved;
+    }
+    return this.#defaultEffortForModel(normalizedModel);
   }
 
   #getCurrentEffort() {
@@ -1106,7 +1119,13 @@ class CodexSessionBridge {
     }
 
     const effortRaw = args.join(' ');
-    const effort = normalizeReasoningEffortInput(effortRaw);
+    const requestedEffort = normalizeReasoningEffortInput(effortRaw);
+    if (!requestedEffort) {
+      this.#emitCommandText(callbacks, 'Usage: /effort <none|minimal|low|medium|high|xhigh>');
+      return true;
+    }
+
+    const effort = this.#coerceEffortForModel(this.model, requestedEffort);
     if (!effort) {
       this.#emitCommandText(callbacks, 'Usage: /effort <none|minimal|low|medium|high|xhigh>');
       return true;
@@ -1114,10 +1133,20 @@ class CodexSessionBridge {
 
     this.effortByModel[this.model] = effort;
     this.#persistModelState();
-    this.#emitCommandText(
-      callbacks,
-      `Reasoning effort set.\nModel: ${this.model}\nEffort: ${effort}`,
-    );
+    if (effort !== requestedEffort) {
+      this.#emitCommandText(
+        callbacks,
+        [
+          `Reasoning effort '${requestedEffort}' is unsupported for model '${this.model}'.`,
+          `Using '${effort}' instead.`,
+          `Model: ${this.model}`,
+          `Effort: ${effort}`,
+        ].join('\n'),
+      );
+      return true;
+    }
+
+    this.#emitCommandText(callbacks, `Reasoning effort set.\nModel: ${this.model}\nEffort: ${effort}`);
     return true;
   }
 
@@ -1235,6 +1264,22 @@ class CodexSessionBridge {
     return {
       developerInstructions: this.sessionGuidance,
     };
+  }
+
+  #isSparkLikeModel(model) {
+    return String(model || '').toLowerCase().includes('spark');
+  }
+
+  #defaultEffortForModel(model) {
+    return this.#isSparkLikeModel(model) ? 'xhigh' : 'medium';
+  }
+
+  #coerceEffortForModel(model, effort) {
+    const normalizedEffort = normalizeReasoningEffort(effort);
+    if (!normalizedEffort) return null;
+    if (!this.#isSparkLikeModel(model)) return normalizedEffort;
+    if (SPARK_SUPPORTED_EFFORTS.has(normalizedEffort)) return normalizedEffort;
+    return 'low';
   }
 }
 
