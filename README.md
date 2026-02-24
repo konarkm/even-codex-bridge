@@ -43,6 +43,11 @@ This repo is configured for YOLO mode:
 - `STT_API_KEY=<your key>`
 - `STT_MODEL_ID=scribe_v2_realtime`
 - `STT_COMMIT_STRATEGY=vad`
+- Optional VAD tuning (noise/false-positive control):
+  - `STT_VAD_THRESHOLD`
+  - `STT_MIN_SPEECH_DURATION_MS`
+  - `STT_MIN_SILENCE_DURATION_MS`
+  - `STT_VAD_SILENCE_THRESHOLD_SECS`
 
 For text-only mode without mic STT, set `STT_PROVIDER=none` and use manual text submit.
 
@@ -142,6 +147,12 @@ Server -> client:
 
 ## Slash Commands
 Accepted in `text.submit` as either typed slash or spoken "slash":
+- `/help` or `slash help`
+- `/status` or `slash status`
+- `/debug` or `slash debug`
+- `/stop` or `slash stop`
+- `/reset` or `slash reset`
+- `/compact` or `slash compact`
 - `/restart codex` or `slash restart codex`
 - `/restart bridge` or `slash restart bridge`
 - `/restart both` or `slash restart both`
@@ -149,9 +160,19 @@ Accepted in `text.submit` as either typed slash or spoken "slash":
 - `/thread new` or `slash thread new`
 
 Behavior:
+- `help`: lists supported commands.
+- `status`: prints runtime status and key config toggles.
+- `debug`: prints current turn/transport diagnostics.
+- `stop`: requests interrupt of the active turn.
+- `reset`: starts a fresh thread (same effect as `thread new`).
+- `compact`: requests thread compaction.
+- During compaction lifecycle, bridge emits:
+  - `Compaction started.`
+  - `Compaction complete.`
 - `restart codex`: restarts only Codex app-server in-process, attempts thread resume, then falls back to a fresh thread.
 - `restart bridge`: exits server with code `42`; supervised launcher restarts process.
 - `restart both`: same process restart path as `restart bridge`.
+- Spoken STT variants `codec` and `codecs` are accepted as `codex` for `/restart`.
 - `thread`: prints current thread id and active turn id.
 - `thread new`: starts a fresh thread (intentionally bypasses resume).
 

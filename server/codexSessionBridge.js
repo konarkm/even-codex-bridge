@@ -33,6 +33,18 @@ class CodexSessionBridge {
     this.sttLanguage = options.sttLanguage || 'en';
     this.sttModelId = options.sttModelId || 'scribe_v2_realtime';
     this.sttCommitStrategy = options.sttCommitStrategy || 'vad';
+    this.sttVadThreshold = Number.isFinite(options.sttVadThreshold) ? options.sttVadThreshold : null;
+    this.sttMinSpeechDurationMs = Number.isFinite(options.sttMinSpeechDurationMs)
+      ? options.sttMinSpeechDurationMs
+      : null;
+    this.sttMinSilenceDurationMs = Number.isFinite(options.sttMinSilenceDurationMs)
+      ? options.sttMinSilenceDurationMs
+      : null;
+    this.sttVadSilenceThresholdSecs = Number.isFinite(options.sttVadSilenceThresholdSecs)
+      ? options.sttVadSilenceThresholdSecs
+      : null;
+    this.enableDefaultThreadResume = Boolean(options.enableDefaultThreadResume);
+    this.enablePersistThreadState = Boolean(options.enablePersistThreadState);
     this.onRestartRequested = typeof options.onRestartRequested === 'function'
       ? options.onRestartRequested
       : null;
@@ -314,6 +326,10 @@ class CodexSessionBridge {
       modelId: this.sttModelId,
       language: this.sttLanguage,
       commitStrategy: this.sttCommitStrategy,
+      vadThreshold: this.sttVadThreshold,
+      minSpeechDurationMs: this.sttMinSpeechDurationMs,
+      minSilenceDurationMs: this.sttMinSilenceDurationMs,
+      vadSilenceThresholdSecs: this.sttVadSilenceThresholdSecs,
       logger: this.logger,
       onPartial: (text) => {
         callbacks.onTranscriptDelta({
@@ -659,9 +675,33 @@ class CodexSessionBridge {
         });
         return;
       }
+      case 'item/started': {
+        const item = event?.params?.item;
+        if (!item || item.type !== 'contextCompaction') return;
+
+        callbacks.onStatus({
+          phase: 'compaction_started',
+          detail: 'Compaction started',
+          sessionId: this.threadId,
+        });
+        this.#emitCommandText(callbacks, 'Compaction started.');
+        return;
+      }
       case 'item/completed': {
         const item = event?.params?.item;
-        if (!item || item.type !== 'agentMessage') return;
+        if (!item) return;
+
+        if (item.type === 'contextCompaction') {
+          callbacks.onStatus({
+            phase: 'compaction_completed',
+            detail: 'Compaction complete',
+            sessionId: this.threadId,
+          });
+          this.#emitCommandText(callbacks, 'Compaction complete.');
+          return;
+        }
+
+        if (item.type !== 'agentMessage') return;
 
         const turnId = event?.params?.turnId || state.activeTurnId || 'turn-unknown';
         const itemId = item.id;
@@ -751,6 +791,47 @@ class CodexSessionBridge {
       return true;
     }
 
+    if (command.name === 'help') {
+      this.#emitCommandText(
+        callbacks,
+        [
+          'Commands:',
+          '/help - show this help',
+          '/status - show runtime status',
+          '/stop - interrupt active turn',
+          '/reset - start a fresh thread',
+          '/debug - show current turn diagnostics',
+          '/compact - request thread compaction',
+          '/restart <codex|bridge|both> - restart runtime components',
+          '/thread - show thread and active turn',
+          '/thread new - start a new thread',
+        ].join('\n'),
+      );
+      return true;
+    }
+
+    if (command.name === 'status') {
+      this.#emitCommandText(callbacks, this.#renderStatus(state));
+      return true;
+    }
+
+    if (command.name === 'debug') {
+      this.#emitCommandText(callbacks, this.#renderDebug(state));
+      return true;
+    }
+
+    if (command.name === 'stop') {
+      return this.#handleStopCommand(state, callbacks);
+    }
+
+    if (command.name === 'reset') {
+      return this.#handleThreadCommand(state, callbacks, ['new']);
+    }
+
+    if (command.name === 'compact') {
+      return this.#handleCompactCommand(state, callbacks);
+    }
+
     if (command.name === 'thread') {
       return this.#handleThreadCommand(state, callbacks, command.args);
     }
@@ -760,11 +841,16 @@ class CodexSessionBridge {
       return true;
     }
 
-    const target = String(command.args[0] || '').toLowerCase();
-    if (!target) {
+    const targetRaw = String(command.args[0] || '').toLowerCase();
+    if (!targetRaw) {
       this.#emitCommandText(callbacks, 'Usage: /restart <codex|bridge|both>');
       return true;
     }
+    const targetAliases = {
+      codec: 'codex',
+      codecs: 'codex',
+    };
+    const target = targetAliases[targetRaw] || targetRaw;
 
     if (target === 'codex') {
       this.#emitCommandText(callbacks, 'Restarting codex now...');
@@ -810,6 +896,90 @@ class CodexSessionBridge {
     }
 
     this.#emitCommandText(callbacks, 'Usage: /restart <codex|bridge|both>');
+    return true;
+  }
+
+  #renderStatus(state) {
+    return [
+      'Bridge Status',
+      `running: ${state.running}`,
+      `thread: ${state.threadId || this.threadId || '(none)'}`,
+      `active_turn: ${state.activeTurnId || '(none)'}`,
+      `model: ${this.model}`,
+      `stt_provider: ${this.sttProvider}`,
+      `transport_lost: ${this.transportLost}`,
+      `resume_default: ${this.enableDefaultThreadResume}`,
+      `persist_thread_state: ${this.enablePersistThreadState}`,
+    ].join('\n');
+  }
+
+  #renderDebug(state) {
+    const draftCount = this.itemDrafts.size;
+    const recovering = Boolean(this.recoverPromise);
+    return [
+      'Bridge Debug',
+      `running: ${state.running}`,
+      `thread: ${state.threadId || this.threadId || '(none)'}`,
+      `active_turn: ${state.activeTurnId || '(none)'}`,
+      `transport_lost: ${this.transportLost}`,
+      `recovering: ${recovering}`,
+      `draft_items: ${draftCount}`,
+      `stt_provider: ${this.sttProvider}`,
+      `stt_model: ${this.sttModelId}`,
+    ].join('\n');
+  }
+
+  async #handleStopCommand(state, callbacks) {
+    if (!state.running || !this.rpc || !this.threadId) {
+      this.#emitCommandText(callbacks, 'Session is not running.');
+      return true;
+    }
+
+    if (!state.activeTurnId) {
+      this.#emitCommandText(callbacks, 'Nothing to interrupt.');
+      return true;
+    }
+
+    try {
+      await this.rpc.request('turn/interrupt', {
+        threadId: this.threadId,
+        turnId: state.activeTurnId,
+      }, 30000);
+      this.#emitCommandText(callbacks, 'Interrupt requested.');
+    } catch (error) {
+      const message = error?.message || String(error);
+      callbacks.onError({
+        code: 'turn_interrupt_failed',
+        message,
+        recoverable: true,
+      });
+      this.#emitCommandText(callbacks, `Interrupt failed: ${message}`);
+    }
+
+    return true;
+  }
+
+  async #handleCompactCommand(state, callbacks) {
+    if (!state.running || !this.rpc || !this.threadId) {
+      this.#emitCommandText(callbacks, 'No active thread to compact.');
+      return true;
+    }
+
+    try {
+      await this.rpc.request('thread/compact/start', {
+        threadId: this.threadId,
+      }, 30000);
+      this.#emitCommandText(callbacks, `Compaction requested for thread ${this.threadId}`);
+    } catch (error) {
+      const message = error?.message || String(error);
+      callbacks.onError({
+        code: 'thread_compact_failed',
+        message,
+        recoverable: true,
+      });
+      this.#emitCommandText(callbacks, `Compaction failed: ${message}`);
+    }
+
     return true;
   }
 

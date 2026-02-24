@@ -1,4 +1,25 @@
-const SUPPORTED_COMMANDS = new Set(['restart', 'thread']);
+const SUPPORTED_COMMANDS = new Set([
+  'help',
+  'status',
+  'stop',
+  'reset',
+  'debug',
+  'thread',
+  'compact',
+  'restart',
+]);
+
+function normalizeCommandToken(token, options = {}) {
+  const trimmed = String(token || '').trim();
+  if (!trimmed) return '';
+
+  const unquoted = trimmed.replace(/^[`"']+|[`"']+$/g, '');
+  const withoutTrailingPunctuation = unquoted.replace(/[.,!?;:]+$/g, '');
+  const normalized = withoutTrailingPunctuation.trim();
+  if (!normalized) return '';
+
+  return options.lowercase ? normalized.toLowerCase() : normalized;
+}
 
 function parseSlashCommand(input) {
   const raw = String(input || '').trim();
@@ -18,8 +39,11 @@ function parseSlashCommand(input) {
     return null;
   }
 
-  const [nameRaw = '', ...args] = commandBody.split(/\s+/).filter(Boolean);
-  const name = nameRaw.toLowerCase();
+  const [nameRaw = '', ...argsRaw] = commandBody.split(/\s+/).filter(Boolean);
+  const name = normalizeCommandToken(nameRaw, { lowercase: true });
+  const args = argsRaw
+    .map((token) => normalizeCommandToken(token))
+    .filter(Boolean);
   if (!name) {
     return null;
   }

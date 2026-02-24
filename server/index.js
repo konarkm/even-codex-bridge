@@ -25,6 +25,10 @@ const STT_API_KEY = process.env.STT_API_KEY || '';
 const STT_LANGUAGE = process.env.STT_LANGUAGE || 'en';
 const STT_MODEL_ID = process.env.STT_MODEL_ID || 'scribe_v2_realtime';
 const STT_COMMIT_STRATEGY = process.env.STT_COMMIT_STRATEGY || 'vad';
+const STT_VAD_THRESHOLD = parseOptionalNumber(process.env.STT_VAD_THRESHOLD);
+const STT_MIN_SPEECH_DURATION_MS = parseOptionalNumber(process.env.STT_MIN_SPEECH_DURATION_MS);
+const STT_MIN_SILENCE_DURATION_MS = parseOptionalNumber(process.env.STT_MIN_SILENCE_DURATION_MS);
+const STT_VAD_SILENCE_THRESHOLD_SECS = parseOptionalNumber(process.env.STT_VAD_SILENCE_THRESHOLD_SECS);
 const ENABLE_DEFAULT_THREAD_RESUME = ['1', 'true', 'yes', 'on']
   .includes(String(process.env.ENABLE_DEFAULT_THREAD_RESUME ?? '1').trim().toLowerCase());
 const ENABLE_PERSIST_THREAD_STATE = ['1', 'true', 'yes', 'on']
@@ -43,6 +47,13 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+
+function parseOptionalNumber(value) {
+  const trimmed = String(value ?? '').trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 if (!CLIENT_SHARED_TOKEN) {
   throw new Error('Missing CLIENT_SHARED_TOKEN in environment');
@@ -230,6 +241,12 @@ wss.on('connection', (ws, req) => {
     sttLanguage: STT_LANGUAGE,
     sttModelId: STT_MODEL_ID,
     sttCommitStrategy: STT_COMMIT_STRATEGY,
+    sttVadThreshold: STT_VAD_THRESHOLD,
+    sttMinSpeechDurationMs: STT_MIN_SPEECH_DURATION_MS,
+    sttMinSilenceDurationMs: STT_MIN_SILENCE_DURATION_MS,
+    sttVadSilenceThresholdSecs: STT_VAD_SILENCE_THRESHOLD_SECS,
+    enableDefaultThreadResume: ENABLE_DEFAULT_THREAD_RESUME,
+    enablePersistThreadState: ENABLE_PERSIST_THREAD_STATE,
     onRestartRequested: (target) => {
       scheduleProcessRestart(target, clientId);
     },
@@ -490,6 +507,12 @@ server.listen(PORT, '0.0.0.0', () => {
     model: CODEX_MODEL,
     sttProvider: STT_PROVIDER,
     sttModelId: STT_MODEL_ID,
+    sttVadTuning: {
+      vadThreshold: STT_VAD_THRESHOLD,
+      minSpeechDurationMs: STT_MIN_SPEECH_DURATION_MS,
+      minSilenceDurationMs: STT_MIN_SILENCE_DURATION_MS,
+      vadSilenceThresholdSecs: STT_VAD_SILENCE_THRESHOLD_SECS,
+    },
     codexCwd: CODEX_CWD,
     allowedOrigins,
     persistThreadState: ENABLE_PERSIST_THREAD_STATE,

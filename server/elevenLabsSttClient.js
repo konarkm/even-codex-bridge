@@ -1,11 +1,26 @@
 const WebSocket = require('ws');
 
+function parseOptionalNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function clampOptionalNumber(value, min, max) {
+  const parsed = parseOptionalNumber(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.min(max, Math.max(min, parsed));
+}
+
 class ElevenLabsSttClient {
   constructor(options) {
     this.apiKey = options.apiKey;
     this.modelId = options.modelId || 'scribe_v2_realtime';
     this.language = options.language || 'en';
     this.commitStrategy = options.commitStrategy || 'vad';
+    this.vadThreshold = clampOptionalNumber(options.vadThreshold, 0.1, 0.9);
+    this.minSpeechDurationMs = clampOptionalNumber(options.minSpeechDurationMs, 50, 2000);
+    this.minSilenceDurationMs = clampOptionalNumber(options.minSilenceDurationMs, 50, 2000);
+    this.vadSilenceThresholdSecs = clampOptionalNumber(options.vadSilenceThresholdSecs, 0.3, 3.0);
     this.logger = options.logger;
     this.onPartial = options.onPartial;
     this.onFinal = options.onFinal;
@@ -85,6 +100,18 @@ class ElevenLabsSttClient {
     url.searchParams.set('audio_format', 'pcm_16000');
     url.searchParams.set('commit_strategy', this.commitStrategy);
     url.searchParams.set('include_timestamps', 'false');
+    if (Number.isFinite(this.vadThreshold)) {
+      url.searchParams.set('vad_threshold', String(this.vadThreshold));
+    }
+    if (Number.isFinite(this.minSpeechDurationMs)) {
+      url.searchParams.set('min_speech_duration_ms', String(Math.round(this.minSpeechDurationMs)));
+    }
+    if (Number.isFinite(this.minSilenceDurationMs)) {
+      url.searchParams.set('min_silence_duration_ms', String(Math.round(this.minSilenceDurationMs)));
+    }
+    if (Number.isFinite(this.vadSilenceThresholdSecs)) {
+      url.searchParams.set('vad_silence_threshold_secs', String(this.vadSilenceThresholdSecs));
+    }
 
     const socket = new WebSocket(url.toString(), {
       headers: {

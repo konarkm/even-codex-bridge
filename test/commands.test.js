@@ -28,9 +28,15 @@ test('parseSlashCommand ignores non-command text', () => {
   assert.equal(parsed, null);
 });
 
-test('parseSlashCommand marks unknown commands unsupported', () => {
+test('parseSlashCommand supports status command', () => {
   const parsed = parseSlashCommand('/status');
   assert.equal(parsed?.name, 'status');
+  assert.equal(parsed?.supported, true);
+});
+
+test('parseSlashCommand marks unsupported commands', () => {
+  const parsed = parseSlashCommand('/notifications');
+  assert.equal(parsed?.name, 'notifications');
   assert.equal(parsed?.supported, false);
 });
 
@@ -40,6 +46,36 @@ test('parseSlashCommand supports thread command', () => {
     name: 'thread',
     args: ['new'],
     raw: '/thread new',
+    supported: true,
+  });
+});
+
+test('parseSlashCommand handles trailing punctuation in command name', () => {
+  const parsed = parseSlashCommand('slash status.');
+  assert.deepEqual(parsed, {
+    name: 'status',
+    args: [],
+    raw: 'slash status.',
+    supported: true,
+  });
+});
+
+test('parseSlashCommand handles trailing punctuation in arguments', () => {
+  const parsed = parseSlashCommand('/restart codex.');
+  assert.deepEqual(parsed, {
+    name: 'restart',
+    args: ['codex'],
+    raw: '/restart codex.',
+    supported: true,
+  });
+});
+
+test('parseSlashCommand strips punctuation from thread action', () => {
+  const parsed = parseSlashCommand('/thread new!');
+  assert.deepEqual(parsed, {
+    name: 'thread',
+    args: ['new'],
+    raw: '/thread new!',
     supported: true,
   });
 });
