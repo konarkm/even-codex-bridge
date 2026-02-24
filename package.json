@@ -5,7 +5,8 @@
   "main": "server/index.js",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "dev:server": "node server/index.js",
+    "dev:server": "./scripts/local/run-codex-even-server.sh",
+    "dev:server:raw": "node server/index.js",
     "dev:client": "vite --host 0.0.0.0 --port 5173",
     "dev": "concurrently -k -n SERVER,CLIENT -c green,cyan \"npm:dev:server\" \"npm:dev:client\"",
     "tunnel": "./scripts/local/run-codex-even-tunnel.sh",

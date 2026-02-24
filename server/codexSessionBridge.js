@@ -1,4 +1,5 @@
 const { CodexRpcClient } = require('./codexRpcClient');
+const { parseSlashCommand } = require('./commands');
 const { ElevenLabsSttClient } = require('./elevenLabsSttClient');
 
 function asTextInput(text) {
@@ -32,6 +33,9 @@ class CodexSessionBridge {
     this.sttLanguage = options.sttLanguage || 'en';
     this.sttModelId = options.sttModelId || 'scribe_v2_realtime';
     this.sttCommitStrategy = options.sttCommitStrategy || 'vad';
+    this.onRestartRequested = typeof options.onRestartRequested === 'function'
+      ? options.onRestartRequested
+      : null;
 
     this.rpc = null;
     this.stt = null;
@@ -55,7 +59,7 @@ class CodexSessionBridge {
     this.transportLost = false;
 
     await this.#createAndStartRpc(state, callbacks);
-    await this.#startThread(state, callbacks);
+    await this.#startThread(state, callbacks, startPayload?.resumeThreadId);
 
     await this.#startStt(state, callbacks);
 
@@ -101,6 +105,11 @@ class CodexSessionBridge {
   async submitText(state, callbacks, rawText, source = 'manual') {
     const text = String(rawText || '').trim();
     if (!text) return false;
+
+    const slashCommand = parseSlashCommand(text);
+    if (slashCommand) {
+      return this.#handleSlashCommand(state, callbacks, slashCommand);
+    }
 
     if (!state.running) {
       callbacks.onError({
@@ -222,6 +231,41 @@ class CodexSessionBridge {
     return true;
   }
 
+  async restartCodex(state, callbacks) {
+    if (!state.running) {
+      throw new Error('Cannot restart codex because session is not running');
+    }
+
+    const previousThreadId = state.threadId || this.threadId;
+
+    callbacks.onStatus({
+      phase: 'restarting_codex',
+      detail: 'Restarting Codex app-server session',
+      sessionId: this.threadId,
+    });
+
+    this.itemDrafts.clear();
+    state.clearActiveTurn();
+    await this.#restartRpcOnly(state, callbacks);
+
+    const resumed = await this.#tryResumeThread(state, callbacks, previousThreadId, {
+      emitFailStatus: true,
+      successDetail: 'Reattached existing thread after codex restart',
+      failDetail: 'Existing thread unavailable; starting a new thread',
+    });
+    if (!resumed) {
+      await this.#startThread(state, callbacks);
+    }
+
+    callbacks.onStatus({
+      phase: 'running',
+      detail: 'Codex restarted and ready',
+      sessionId: this.threadId,
+    });
+
+    return { threadId: this.threadId };
+  }
+
   ingestAudio(state, audioBuffer, callbacks) {
     if (!state.running) return false;
 
@@ -332,9 +376,17 @@ class CodexSessionBridge {
     this.transportLost = false;
   }
 
-  async #startThread(state, callbacks) {
+  async #startThread(state, callbacks, preferredThreadId = null) {
     if (!this.rpc) {
       throw new Error('Codex RPC is not ready');
+    }
+
+    const resumed = await this.#tryResumeThread(state, callbacks, preferredThreadId, {
+      emitFailStatus: false,
+      successDetail: 'Resumed prior Codex thread',
+    });
+    if (resumed) {
+      return;
     }
 
     const makeThreadStartParams = () => ({
@@ -494,6 +546,52 @@ class CodexSessionBridge {
     return this.recoverPromise;
   }
 
+  async #tryResumeThread(state, callbacks, threadId, options = {}) {
+    if (!this.rpc || !threadId) {
+      return false;
+    }
+
+    const emitFailStatus = options.emitFailStatus ?? true;
+    const successDetail = options.successDetail || 'Reattached existing thread';
+    const failDetail = options.failDetail || 'Existing thread unavailable; starting a new thread';
+
+    try {
+      const resumeRaw = await this.rpc.request('thread/resume', {
+        threadId,
+      });
+
+      const resumedThreadId = resumeRaw?.thread?.id;
+      if (!resumedThreadId) {
+        throw new Error('Invalid thread/resume response from Codex app-server');
+      }
+
+      this.threadId = resumedThreadId;
+      this.transportLost = false;
+      state.markRunning(resumedThreadId);
+      state.clearActiveTurn();
+
+      callbacks.onStatus({
+        phase: 'thread_resumed',
+        detail: successDetail,
+        sessionId: resumedThreadId,
+      });
+      return true;
+    } catch (error) {
+      this.logger.warn('thread_resume_failed', {
+        threadId,
+        message: error?.message || String(error),
+      });
+      if (emitFailStatus) {
+        callbacks.onStatus({
+          phase: 'thread_resume_failed',
+          detail: failDetail,
+          sessionId: null,
+        });
+      }
+      return false;
+    }
+  }
+
   async #handleNotification(state, callbacks, event) {
     switch (event.method) {
       case 'thread/started': {
@@ -636,6 +734,111 @@ class CodexSessionBridge {
     }
 
     await this.rpc.respondError(event.id, -32601, `Unsupported server request method: ${event.method}`);
+  }
+
+  #emitCommandText(callbacks, text) {
+    callbacks.onTranscriptFinal({
+      text: String(text || ''),
+      turnId: `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+      role: 'assistant',
+      ts: Date.now(),
+    });
+  }
+
+  async #handleSlashCommand(state, callbacks, command) {
+    if (!command.supported) {
+      this.#emitCommandText(callbacks, `Unknown command: ${command.name}`);
+      return true;
+    }
+
+    if (command.name === 'thread') {
+      return this.#handleThreadCommand(state, callbacks, command.args);
+    }
+
+    if (command.name !== 'restart') {
+      this.#emitCommandText(callbacks, `Unknown command: ${command.name}`);
+      return true;
+    }
+
+    const target = String(command.args[0] || '').toLowerCase();
+    if (!target) {
+      this.#emitCommandText(callbacks, 'Usage: /restart <codex|bridge|both>');
+      return true;
+    }
+
+    if (target === 'codex') {
+      this.#emitCommandText(callbacks, 'Restarting codex now...');
+      try {
+        const { threadId } = await this.restartCodex(state, callbacks);
+        this.#emitCommandText(callbacks, `Codex restarted and back online.\nThread: ${threadId || '(none)'}`);
+      } catch (error) {
+        const message = error?.message || String(error);
+        callbacks.onError({
+          code: 'restart_codex_failed',
+          message,
+          recoverable: true,
+        });
+        this.#emitCommandText(callbacks, `Codex restart failed: ${message}`);
+      }
+      return true;
+    }
+
+    if (target === 'bridge' || target === 'both') {
+      this.#emitCommandText(
+        callbacks,
+        target === 'both'
+          ? 'Restarting bridge and codex now...'
+          : 'Restarting bridge now...',
+      );
+
+      try {
+        await this.stop(state, callbacks, { sendStatus: false });
+      } catch {
+        // Ignore teardown errors for explicit restart request.
+      }
+
+      if (this.onRestartRequested) {
+        this.onRestartRequested(target);
+      } else {
+        callbacks.onError({
+          code: 'restart_bridge_unavailable',
+          message: 'Bridge restart is not wired in this runtime',
+          recoverable: true,
+        });
+      }
+      return true;
+    }
+
+    this.#emitCommandText(callbacks, 'Usage: /restart <codex|bridge|both>');
+    return true;
+  }
+
+  async #handleThreadCommand(state, callbacks, args) {
+    const action = String(args[0] || '').toLowerCase();
+    if (!action) {
+      this.#emitCommandText(
+        callbacks,
+        `Thread: ${state.threadId || this.threadId || '(none)'}\nActive turn: ${state.activeTurnId || '(none)'}`,
+      );
+      return true;
+    }
+
+    if (action === 'new') {
+      if (!state.running || !this.rpc) {
+        this.#emitCommandText(callbacks, 'Session is not running.');
+        return true;
+      }
+
+      this.#emitCommandText(callbacks, 'Starting a new thread...');
+      this.itemDrafts.clear();
+      state.clearActiveTurn();
+      await this.#startThread(state, callbacks);
+      this.#emitCommandText(callbacks, `New thread started: ${this.threadId || '(none)'}`);
+      return true;
+    }
+
+    this.#emitCommandText(callbacks, 'Usage: /thread [new]');
+    return true;
   }
 
   #isUnsupportedTurnSteer(error) {

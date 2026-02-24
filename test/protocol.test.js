@@ -18,6 +18,23 @@ test('parseClientMessage accepts valid text.submit payload', () => {
   assert.equal(parsed.value.type, 'text.submit');
 });
 
+test('parseClientMessage accepts session.start with resumeThreadId', () => {
+  const parsed = parseClientMessage(
+    JSON.stringify({
+      type: 'session.start',
+      payload: {
+        appVersion: '0.1.0',
+        clientTs: Date.now(),
+        resumeThreadId: 'thread_123',
+      },
+    }),
+  );
+
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.value.type, 'session.start');
+  assert.equal(parsed.value.payload.resumeThreadId, 'thread_123');
+});
+
 test('parseClientMessage rejects malformed audio payload', () => {
   const parsed = parseClientMessage(
     JSON.stringify({

@@ -68,6 +68,7 @@ const wsOverride = queryParams.get('ws');
 const tokenOverride = queryParams.get('token');
 const storedWsUrl = wsOverride || safeGetItem('ambient_ws_url', DEFAULT_WS_URL);
 const storedToken = tokenOverride || safeGetItem('ambient_ws_token', DEFAULT_TOKEN);
+let resumeThreadId = safeGetItem('ambient_thread_id', '');
 
 if (storedWsUrl) els.wsUrl.value = storedWsUrl;
 if (storedToken) els.token.value = storedToken;
@@ -360,11 +361,13 @@ wsClient.addEventListener('open', () => {
     appVersion: '0.1.0',
     deviceInfo: cachedDeviceInfo,
     clientTs: Date.now(),
+    resumeThreadId: resumeThreadId || undefined,
   };
   const sent = wsClient.send('session.start', startPayload);
   logger.info('Sent session.start', {
     sent,
     wsOpen: wsClient.isOpen(),
+    resumeThreadId: resumeThreadId || null,
   });
 
   if (els.submitBtn) {
@@ -428,6 +431,12 @@ wsClient.addEventListener('message', (event) => {
 
   switch (msg.type) {
     case 'status': {
+      const sessionId = String(msg.payload?.sessionId || '').trim();
+      if (sessionId) {
+        resumeThreadId = sessionId;
+        safeSetItem('ambient_thread_id', resumeThreadId);
+      }
+
       const detail = msg.payload?.detail ? ` - ${msg.payload.detail}` : '';
       const phase = msg.payload?.phase || 'unknown';
       const rollover = msg.payload?.rolloverInSec;

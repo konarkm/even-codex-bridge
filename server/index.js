@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const http = require('node:http');
+const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const express = require('express');
 const cors = require('cors');
@@ -10,6 +11,7 @@ const { createLogger } = require('./logger');
 const { parseClientMessage, makeOutboundMessage } = require('./protocol');
 const { ClientSessionState } = require('./sessionState');
 const { CodexSessionBridge } = require('./codexSessionBridge');
+const { ThreadStateStore } = require('./threadStateStore');
 
 const logger = createLogger('server');
 
@@ -23,6 +25,11 @@ const STT_API_KEY = process.env.STT_API_KEY || '';
 const STT_LANGUAGE = process.env.STT_LANGUAGE || 'en';
 const STT_MODEL_ID = process.env.STT_MODEL_ID || 'scribe_v2_realtime';
 const STT_COMMIT_STRATEGY = process.env.STT_COMMIT_STRATEGY || 'vad';
+const ENABLE_DEFAULT_THREAD_RESUME = ['1', 'true', 'yes', 'on']
+  .includes(String(process.env.ENABLE_DEFAULT_THREAD_RESUME ?? '1').trim().toLowerCase());
+const ENABLE_PERSIST_THREAD_STATE = ['1', 'true', 'yes', 'on']
+  .includes(String(process.env.ENABLE_PERSIST_THREAD_STATE || '').trim().toLowerCase());
+const THREAD_STATE_FILE = process.env.THREAD_STATE_FILE || '.runtime/thread-state.json';
 
 const DEFAULT_ALLOWED_ORIGINS = new Set([
   'https://codex-even-app.example.com',
@@ -40,6 +47,13 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
 if (!CLIENT_SHARED_TOKEN) {
   throw new Error('Missing CLIENT_SHARED_TOKEN in environment');
 }
+
+const threadStateStore = new ThreadStateStore({
+  enabled: ENABLE_PERSIST_THREAD_STATE,
+  filePath: path.resolve(process.cwd(), THREAD_STATE_FILE),
+  logger,
+});
+threadStateStore.initialize();
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -77,6 +91,10 @@ app.get('/health', (_req, res) => {
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
+const EXIT_CODE_RESTART = 42;
+let shuttingDown = false;
+let pendingRestartTarget = null;
+const activeConnections = new Set();
 
 function decodeBase64Url(value) {
   try {
@@ -129,6 +147,59 @@ function isBenignTeardownError(msgType, message, state, ws) {
   return false;
 }
 
+async function gracefulExit(exitCode, reason, extra = {}) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+
+  logger.info('Server shutdown requested', {
+    reason,
+    exitCode,
+    ...extra,
+  });
+
+  const forceExitTimer = setTimeout(() => {
+    process.exit(exitCode);
+  }, 2000);
+
+  try {
+    const stops = [...activeConnections].map((entry) => entry.stop('server_shutdown'));
+    await Promise.allSettled(stops);
+
+    await Promise.allSettled([
+      new Promise((resolve) => wss.close(() => resolve())),
+      new Promise((resolve) => server.close(() => resolve())),
+    ]);
+  } finally {
+    clearTimeout(forceExitTimer);
+    process.exit(exitCode);
+  }
+}
+
+function scheduleProcessRestart(target, clientId) {
+  if (shuttingDown) {
+    return;
+  }
+  if (pendingRestartTarget) {
+    return;
+  }
+
+  pendingRestartTarget = target;
+  logger.info('Runtime restart requested', {
+    target,
+    clientId,
+    exitCode: EXIT_CODE_RESTART,
+  });
+
+  setTimeout(() => {
+    void gracefulExit(EXIT_CODE_RESTART, 'restart requested', {
+      target,
+      clientId,
+    });
+  }, 120);
+}
+
 wss.on('connection', (ws, req) => {
   const origin = req.headers.origin;
   if (!isOriginAllowed(origin)) {
@@ -159,6 +230,9 @@ wss.on('connection', (ws, req) => {
     sttLanguage: STT_LANGUAGE,
     sttModelId: STT_MODEL_ID,
     sttCommitStrategy: STT_COMMIT_STRATEGY,
+    onRestartRequested: (target) => {
+      scheduleProcessRestart(target, clientId);
+    },
   });
 
   logger.info('Client connected', {
@@ -183,6 +257,10 @@ wss.on('connection', (ws, req) => {
 
   const callbacks = {
     onStatus(payload) {
+      const sessionId = String(payload?.sessionId || '').trim();
+      if (sessionId) {
+        threadStateStore.setThreadId(sessionId);
+      }
       send('status', payload);
     },
     onTranscriptDelta(payload) {
@@ -221,7 +299,45 @@ wss.on('connection', (ws, req) => {
   });
 
   let closed = false;
+  let cleanupPromise = null;
   let messageQueue = Promise.resolve();
+
+  async function cleanupConnection(sendStatus = false) {
+    if (cleanupPromise) {
+      return cleanupPromise;
+    }
+
+    closed = true;
+    clearInterval(metricsTimer);
+    cleanupPromise = messageQueue
+      .catch(() => {
+        // Ignore queue failures during teardown.
+      })
+      .then(async () => {
+        try {
+          await bridge.stop(state, callbacks, { sendStatus });
+        } catch {
+          // Ignore teardown errors while disconnecting.
+        }
+      });
+
+    return cleanupPromise;
+  }
+
+  const connectionEntry = {
+    clientId,
+    stop: async (reason) => {
+      if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
+        try {
+          ws.close(1012, reason || 'server_shutdown');
+        } catch {
+          // Ignore close errors.
+        }
+      }
+      await cleanupConnection(false);
+    },
+  };
+  activeConnections.add(connectionEntry);
 
   async function handleClientMessage(msg) {
     if (msg.type === 'session.start') {
@@ -234,7 +350,16 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      await bridge.start(state, callbacks, msg.payload);
+      const clientResumeThreadId = String(msg.payload?.resumeThreadId || '').trim();
+      const persistedResumeThreadId = threadStateStore.getThreadId();
+      const resumeThreadId = ENABLE_DEFAULT_THREAD_RESUME
+        ? (clientResumeThreadId || persistedResumeThreadId || undefined)
+        : undefined;
+
+      await bridge.start(state, callbacks, {
+        ...msg.payload,
+        resumeThreadId,
+      });
       return;
     }
 
@@ -254,13 +379,15 @@ wss.on('connection', (ws, req) => {
     }
 
     if (msg.type === 'text.submit') {
+      const submittedText = String(msg.payload.text || '');
       callbacks.onTranscriptFinal({
-        text: String(msg.payload.text || ''),
+        text: submittedText,
         turnId: `user-${Date.now()}`,
         role: 'user',
         ts: Date.now(),
       });
-      await bridge.submitText(state, callbacks, msg.payload.text, 'manual');
+
+      await bridge.submitText(state, callbacks, submittedText, 'manual');
       return;
     }
 
@@ -329,22 +456,10 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', (code, reasonBuffer) => {
-    closed = true;
-    clearInterval(metricsTimer);
     const reason = Buffer.isBuffer(reasonBuffer) ? reasonBuffer.toString('utf8') : String(reasonBuffer || '');
-
-    messageQueue = messageQueue
-      .catch(() => {
-        // Ignore queue failures during teardown.
-      })
-      .then(async () => {
-        try {
-          await bridge.stop(state, callbacks, { sendStatus: false });
-        } catch {
-          // Ignore teardown errors while disconnecting.
-        }
-      })
+    void cleanupConnection(false)
       .finally(() => {
+        activeConnections.delete(connectionEntry);
         logger.info('Client disconnected', {
           clientId,
           code,
@@ -361,6 +476,14 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+process.on('SIGINT', () => {
+  void gracefulExit(0, 'SIGINT');
+});
+
+process.on('SIGTERM', () => {
+  void gracefulExit(0, 'SIGTERM');
+});
+
 server.listen(PORT, '0.0.0.0', () => {
   logger.info('Even Codex bridge server started', {
     port: PORT,
@@ -369,5 +492,9 @@ server.listen(PORT, '0.0.0.0', () => {
     sttModelId: STT_MODEL_ID,
     codexCwd: CODEX_CWD,
     allowedOrigins,
+    persistThreadState: ENABLE_PERSIST_THREAD_STATE,
+    defaultThreadResume: ENABLE_DEFAULT_THREAD_RESUME,
+    threadStateFile: path.resolve(process.cwd(), THREAD_STATE_FILE),
+    persistedThreadId: threadStateStore.getThreadId() || null,
   });
 });

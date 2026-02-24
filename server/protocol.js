@@ -7,6 +7,7 @@ const SessionStartSchema = z.object({
   appVersion: z.string().min(1),
   deviceInfo: z.record(z.string(), z.any()).optional(),
   clientTs: z.number(),
+  resumeThreadId: z.string().min(1).max(256).optional(),
 });
 
 const AudioChunkSchema = z.object({

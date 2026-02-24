@@ -34,7 +34,11 @@ This repo is configured for YOLO mode:
 - `VITE_CLIENT_SHARED_TOKEN` (must match exactly)
 - `CODEX_CWD`
 - `VITE_WS_BASE_URL`
-3. STT configuration:
+3. Optional thread persistence (recommended):
+- `ENABLE_DEFAULT_THREAD_RESUME=1`
+- `ENABLE_PERSIST_THREAD_STATE=1`
+- `THREAD_STATE_FILE=.runtime/thread-state.json`
+4. STT configuration:
 - `STT_PROVIDER=elevenlabs`
 - `STT_API_KEY=<your key>`
 - `STT_MODEL_ID=scribe_v2_realtime`
@@ -48,6 +52,11 @@ Terminal A:
 npm run dev:server
 ```
 
+`npm run dev:server` is supervised:
+- enforces Codex CLI version `>= 0.101.0`
+- prevents duplicate runs with `.bridge-run.lock`
+- auto-relaunches only when server exits with code `42` (used by `/restart bridge|both`)
+
 Terminal B:
 ```bash
 npm run dev:client
@@ -56,6 +65,11 @@ npm run dev:client
 Or both:
 ```bash
 npm run dev
+```
+
+Run server without supervision (rarely needed):
+```bash
+npm run dev:server:raw
 ```
 
 ### Optional simulator autostart (dev-only)
@@ -112,7 +126,7 @@ Auth for `npm run tunnel` can come from any one of:
 
 ## Protocol
 Client -> server:
-- `session.start`: `{ appVersion, deviceInfo?, clientTs }`
+- `session.start`: `{ appVersion, deviceInfo?, clientTs, resumeThreadId? }`
 - `audio.chunk`: `{ seq, pcmB64, sampleRate:16000, format:"pcm16le", durationMs, byteLength }`
 - `text.submit`: `{ text, clientTs? }`
 - `session.stop`: `{ reason? }`
@@ -125,6 +139,28 @@ Server -> client:
 - `metrics`: runtime counters
 - `error`: `{ code, message, recoverable }`
 - `pong`: `{ serverTs, clientTs? }`
+
+## Slash Commands
+Accepted in `text.submit` as either typed slash or spoken "slash":
+- `/restart codex` or `slash restart codex`
+- `/restart bridge` or `slash restart bridge`
+- `/restart both` or `slash restart both`
+- `/thread` or `slash thread`
+- `/thread new` or `slash thread new`
+
+Behavior:
+- `restart codex`: restarts only Codex app-server in-process, attempts thread resume, then falls back to a fresh thread.
+- `restart bridge`: exits server with code `42`; supervised launcher restarts process.
+- `restart both`: same process restart path as `restart bridge`.
+- `thread`: prints current thread id and active turn id.
+- `thread new`: starts a fresh thread (intentionally bypasses resume).
+
+Stop/start behavior:
+- `ENABLE_DEFAULT_THREAD_RESUME=1` enables resume-by-default on `session.start`.
+- `ENABLE_DEFAULT_THREAD_RESUME=0` forces fresh `thread/start` on `session.start` (client/server resume IDs ignored).
+- The web app caches the latest `sessionId` and sends it as `resumeThreadId` on next `session.start`.
+- If `ENABLE_PERSIST_THREAD_STATE=1`, backend also persists the latest thread id to `THREAD_STATE_FILE`.
+- Backend attempts `thread/resume` first (client `resumeThreadId`, else persisted server thread id), then falls back to `thread/start` if resume is unavailable.
 
 ## UI behavior
 - `text.submit` (manual prompt box) remains a permanent dev/QA path.
