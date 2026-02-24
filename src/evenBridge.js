@@ -196,15 +196,10 @@ export class EvenBridgeController {
     }
   }
 
-  async updateStatus(status) {
+  async updateStatus(statusText) {
     if (!this.bridge || !this.initialized) return;
 
-    const content = normalizeStatusSegment(
-      status && typeof status === 'object'
-        ? `${status.mic || 'listening'} | ${status.connection || 'init'}${status.activity ? ` | ${status.activity}` : ''}`
-        : status || '',
-      STATUS_MAX_CHARS,
-    );
+    const content = normalizeStatusSegment(statusText, STATUS_MAX_CHARS);
     if (content === this.lastStatusText) return;
 
     const updatePayload = {

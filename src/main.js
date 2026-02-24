@@ -306,6 +306,10 @@ function setFlowState(nextState, source) {
   });
 }
 
+function markFlowIdle(source) {
+  setFlowState(FLOW_IDLE, source);
+}
+
 async function handleUiEvent(uiEvent) {
   const eventType = Number(uiEvent?.eventType);
   if (!Number.isFinite(eventType)) return;
@@ -349,7 +353,7 @@ async function handleUiEvent(uiEvent) {
 wsClient.addEventListener('open', () => {
   logger.info('WebSocket open');
   setConnectionState(CONNECTION_CONNECTED);
-  setFlowState(FLOW_IDLE, 'ws_open');
+  markFlowIdle('ws_open');
   setStatus('Connected to backend');
   renderer.setStatus('Connected to backend');
 
@@ -383,7 +387,7 @@ wsClient.addEventListener('close', (event) => {
   });
   stopPingLoop();
   setConnectionState(CONNECTION_DISCONNECTED);
-  setFlowState(FLOW_IDLE, 'ws_close');
+  markFlowIdle('ws_close');
   setStatus('Backend disconnected');
   renderer.setStatus('Backend disconnected. Reconnecting...');
   if (els.submitBtn) {
@@ -398,7 +402,7 @@ wsClient.addEventListener('close', (event) => {
 wsClient.addEventListener('reconnecting', (event) => {
   const { attempt, delay } = event.detail;
   setConnectionState(CONNECTION_RECONNECTING);
-  setFlowState(FLOW_IDLE, 'ws_reconnecting');
+  markFlowIdle('ws_reconnecting');
   setStatus(`Reconnecting (attempt ${attempt})...`);
   renderer.setStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s`);
 
@@ -410,7 +414,7 @@ wsClient.addEventListener('reconnecting', (event) => {
 wsClient.addEventListener('error', (event) => {
   logger.error('WebSocket error', event.detail);
   setConnectionState(CONNECTION_ERROR);
-  setFlowState(FLOW_IDLE, 'ws_error');
+  markFlowIdle('ws_error');
   setStatus(`WebSocket error: ${event.detail.message}`);
   renderer.setStatus(`WebSocket error: ${event.detail.message}`);
 
@@ -435,7 +439,7 @@ wsClient.addEventListener('message', (event) => {
         detail: msg.payload?.detail || null,
       });
       if (phase === 'turn_completed') {
-        setFlowState(FLOW_IDLE, 'status_turn_completed');
+        markFlowIdle('status_turn_completed');
       }
       setStatus(text);
       renderer.setStatus(text);
@@ -474,7 +478,7 @@ wsClient.addEventListener('message', (event) => {
     case 'error': {
       const errorText = `${msg.payload?.code || 'error'}: ${msg.payload?.message || 'Unknown error'}`;
       logger.error('Backend error', msg.payload);
-      setFlowState(FLOW_IDLE, 'backend_error');
+      markFlowIdle('backend_error');
       setStatus(errorText);
       renderer.setStatus(errorText);
       break;
@@ -571,7 +575,7 @@ async function stopAssistant() {
 
   started = false;
   lastDoubleClickEventAt = 0;
-  setFlowState(FLOW_IDLE, 'stop');
+  markFlowIdle('stop');
 
   sendSessionStop('user_requested_stop', 'stopAssistant');
 
@@ -624,7 +628,7 @@ function teardownBestEffort() {
 
   started = false;
   lastDoubleClickEventAt = 0;
-  setFlowState(FLOW_IDLE, 'teardown');
+  markFlowIdle('teardown');
 
   sendSessionStop('window_unload', 'beforeunload');
   wsClient.disconnect();
