@@ -61,7 +61,7 @@ export class UiRenderer {
 
     this.userLiveText = '';
     this.userLiveUpdatedAt = 0;
-    this.userLiveStaleMs = options.userLiveStaleMs || 1800;
+    this.userLiveStaleMs = options.userLiveStaleMs ?? 0;
     this.userLiveExpiryTimer = null;
 
     this.turnDrafts = new Map();
@@ -229,6 +229,8 @@ export class UiRenderer {
   }
 
   #armUserLiveExpiry() {
+    if (this.userLiveStaleMs <= 0) return;
+
     if (this.userLiveExpiryTimer) {
       clearTimeout(this.userLiveExpiryTimer);
     }
@@ -296,22 +298,22 @@ export class UiRenderer {
 
     const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
     if (liveDraft) {
-      lines.push(`[assistant-live] ${liveDraft}`);
+      lines.push(`[codex] ${liveDraft}`);
     }
 
     if (this.userLiveText) {
-      lines.push(`[you-live] ${this.userLiveText}`);
+      lines.push(`[you] ${this.userLiveText}`);
     }
 
     const recent = this.history.slice(-20);
     for (let i = recent.length - 1; i >= 0; i -= 1) {
       const item = recent[i];
-      const label = item.role === 'user' ? 'you' : 'assistant';
+      const label = item.role === 'user' ? 'you' : 'codex';
       lines.push(`[${label}] ${item.text}`);
     }
 
     if (lines.length === 0) {
-      return '[assistant] Waiting for transcript and Codex output...';
+      return '[codex] Waiting for transcript and Codex output...';
     }
 
     return lines.join('\n\n').trim();
@@ -326,16 +328,16 @@ export class UiRenderer {
 
     const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
     if (liveDraft) {
-      lines.push(`[assistant-live] ${liveDraft}`);
+      lines.push(`[codex] ${liveDraft}`);
     }
 
     for (let i = assistantRecent.length - 1; i >= 0; i -= 1) {
       const item = assistantRecent[i];
-      lines.push(`[assistant] ${item.text}`);
+      lines.push(`[codex] ${item.text}`);
     }
 
     if (lines.length === 0) {
-      return '[assistant] Waiting for response...';
+      return '[codex] Waiting for response...';
     }
 
     return lines.join('\n\n').trim();
