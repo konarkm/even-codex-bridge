@@ -132,7 +132,7 @@ export class UiRenderer {
 
   applyTranscriptDelta(payload) {
     const role = payload?.role === 'user' ? 'user' : 'assistant';
-    const chunk = String(payload?.text || '').replace(/\s+/g, ' ').trim();
+    const chunk = String(payload?.text || '');
     const replace = Boolean(payload?.replace);
 
     if (role === 'user') {
