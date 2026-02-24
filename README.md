@@ -128,14 +128,14 @@ Server -> client:
 
 ## UI behavior
 - `text.submit` (manual prompt box) remains a permanent dev/QA path.
-- Single click (`CLICK_EVENT`) toggles mic state:
+- Single click (`CLICK_EVENT`) toggles focus mode:
+  - Focus mode shows assistant output + compact status (`listening|muted` + connection state).
+  - Normal mode keeps richer transcript/status context.
+- Double click (`DOUBLE_CLICK_EVENT`) toggles mic state:
   - `listening` = mic on and STT ingest active.
   - `muted` = mic off (`audioControl(false)`), STT ingest paused.
 - Web app `Mute Mic` / `Unmute Mic` button mirrors the same mic toggle for manual-text-focused testing.
   - If `audioControl(false)` is rejected by host firmware, bridge applies a local mute fallback (stops forwarding audio frames to STT).
-- Double click (`DOUBLE_CLICK_EVENT`) toggles focus mode:
-  - Focus mode shows assistant output + compact status (`listening|muted` + connection state).
-  - Normal mode keeps richer transcript/status context.
 - Ring paging is SDK-native.
   - App-side scroll math/windowing is disabled.
   - Scroll events are only logged for diagnostics; no app-level offset/direction transform is applied.

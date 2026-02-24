@@ -16,6 +16,7 @@ import {
   compactStatusLabel,
   nextManualMicToggle,
   shouldAutoResume,
+  toggleFocusMode,
 } from './uxState.mjs';
 import { WsClient } from './wsClient.js';
 
@@ -325,14 +326,19 @@ async function handleUiEvent(uiEvent) {
     sysEventType: rawEvent?.sysEvent?.eventType ?? null,
   });
 
-  if (eventType === OS_EVENT_DOUBLE_CLICK) {
-    logger.info('Applying double-click mic toggle');
-    await toggleMicManually('ring_double_click');
+  if (eventType === OS_EVENT_CLICK) {
+    focusMode = toggleFocusMode(focusMode);
+    renderer.setFocusMode(focusMode);
+    const focusStatus = focusMode ? 'Focus mode enabled' : 'Focus mode disabled';
+    setStatus(focusStatus);
+    renderer.setStatus(focusStatus);
+    logger.info('Applied single-click focus toggle', { focusMode });
     return;
   }
 
-  if (eventType === OS_EVENT_CLICK) {
-    logger.debug('Ignoring single-click while testing double-click mic toggle');
+  if (eventType === OS_EVENT_DOUBLE_CLICK) {
+    logger.info('Applying double-click mic toggle');
+    await toggleMicManually('ring_double_click');
     return;
   }
 
