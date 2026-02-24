@@ -121,6 +121,7 @@ let connectionState = CONNECTION_UNKNOWN;
 const FLOW_IDLE = 'idle';
 const FLOW_UP = 'up';
 const FLOW_DOWN = 'down';
+const FLOW_THINKING = 'thinking';
 let flowState = FLOW_IDLE;
 
 function refreshMicToggleButton() {
@@ -446,6 +447,9 @@ wsClient.addEventListener('message', (event) => {
         phase,
         detail: msg.payload?.detail || null,
       });
+      if (phase === 'thinking') {
+        setFlowState(FLOW_THINKING, 'status_thinking');
+      }
       if (phase === 'turn_completed') {
         markFlowIdle('status_turn_completed');
       }

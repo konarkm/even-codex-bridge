@@ -50,7 +50,13 @@ export class UiRenderer {
   constructor(options) {
     this.evenBridge = options.evenBridge;
     this.throttleMs = options.throttleMs || 120;
-    this.maxChars = options.maxChars || 2000;
+    this.maxChars = Number(options.maxChars || 1500);
+    this.minChars = Math.max(120, Number(options.minChars || 450));
+    if (this.minChars > this.maxChars) {
+      this.minChars = this.maxChars;
+    }
+    this.contentBudgetStep = Math.max(25, Number(options.contentBudgetStep || 100));
+    this.contentProbeSuccessesNeeded = Math.max(1, Number(options.contentProbeSuccessesNeeded || 20));
     this.logger = options.logger || null;
 
     this.statusText = 'Initializing...';
@@ -67,6 +73,8 @@ export class UiRenderer {
     this.turnDrafts = new Map();
     this.latestDraftTurnId = null;
     this.history = [];
+    this.currentContentBudget = this.maxChars;
+    this.contentFlushSuccesses = 0;
 
     this.pendingTimer = null;
   }
@@ -93,6 +101,8 @@ export class UiRenderer {
     this.turnDrafts.clear();
     this.latestDraftTurnId = null;
     this.history = [];
+    this.currentContentBudget = this.maxChars;
+    this.contentFlushSuccesses = 0;
   }
 
   setStatus(text) {
@@ -192,15 +202,35 @@ export class UiRenderer {
 
   async flushNow() {
     const status = this.#composeStatusLine();
-    const contentText = this.#composeContentText();
 
     await this.evenBridge.updateStatus(status);
-    await this.evenBridge.updateContent(contentText);
+    const attempts = this.#buildContentBudgetAttempts();
+    let contentText = '';
+    let appliedBudget = null;
+
+    for (const budget of attempts) {
+      const candidate = this.#composeContentTextForBudget(budget);
+      contentText = candidate;
+      // eslint-disable-next-line no-await-in-loop
+      const ok = await this.evenBridge.updateContent(candidate);
+      if (ok) {
+        appliedBudget = budget;
+        break;
+      }
+    }
+
+    if (appliedBudget == null) {
+      this.#recordContentFlushFailure();
+    } else {
+      this.#recordContentFlushSuccess(appliedBudget);
+    }
 
     this.logger?.debug?.('Renderer flush', {
       statusLength: String(status || '').length,
       contentLength: contentText.length,
       focusMode: this.focusMode,
+      contentBudget: this.currentContentBudget,
+      appliedBudget,
     });
   }
 
@@ -257,6 +287,7 @@ export class UiRenderer {
     const flowGlyphMap = {
       up: '↑',
       down: '↓',
+      thinking: '~',
       idle: '·',
     };
     const flowGlyph = flowGlyphMap[this.flowState] || '·';
@@ -264,6 +295,8 @@ export class UiRenderer {
     let text = 'idle';
     if (this.flowState === 'up') {
       text = 'sending';
+    } else if (this.flowState === 'thinking') {
+      text = 'thinking';
     } else if (this.flowState === 'down') {
       text = 'streaming';
     } else if (this.micState === MIC_MUTED) {
@@ -282,45 +315,33 @@ export class UiRenderer {
     return `${connectionGlyph}${micGlyph} ${flowGlyph} ${text}`.slice(0, 56);
   }
 
-  #composeContentText() {
-    const output = this.focusMode ? this.#composeFocusContentText() : this.#composeNormalContentText();
-
-    if (output.length <= this.maxChars) {
-      return output;
-    }
-
-    // Newest-first rendering means keep the head and trim older tail content.
-    return `${output.slice(0, this.maxChars - 3)}...`;
-  }
-
-  #composeNormalContentText() {
-    const lines = [];
+  #buildNormalBlocks() {
+    const blocks = [];
 
     const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
     if (liveDraft) {
-      lines.push(`[codex] ${liveDraft}`);
+      blocks.push(`[codex] ${liveDraft}`);
     }
 
     if (this.userLiveText) {
-      lines.push(`[you] ${this.userLiveText}`);
+      blocks.push(`[you] ${this.userLiveText}`);
     }
 
     const recent = this.history.slice(-20);
     for (let i = recent.length - 1; i >= 0; i -= 1) {
       const item = recent[i];
       const label = item.role === 'user' ? 'you' : 'codex';
-      lines.push(`[${label}] ${item.text}`);
+      blocks.push(`[${label}] ${item.text}`);
     }
 
-    if (lines.length === 0) {
-      return '[codex] Waiting for transcript and Codex output...';
+    if (blocks.length === 0) {
+      return ['[codex] Waiting for transcript and Codex output...'];
     }
-
-    return lines.join('\n\n').trim();
+    return blocks;
   }
 
-  #composeFocusContentText() {
-    const lines = [];
+  #buildFocusBlocks() {
+    const blocks = [];
 
     const assistantRecent = this.history
       .filter((item) => item.role === 'assistant')
@@ -328,18 +349,105 @@ export class UiRenderer {
 
     const liveDraft = this.latestDraftTurnId ? this.turnDrafts.get(this.latestDraftTurnId) : '';
     if (liveDraft) {
-      lines.push(`[codex] ${liveDraft}`);
+      blocks.push(`[codex] ${liveDraft}`);
     }
 
     for (let i = assistantRecent.length - 1; i >= 0; i -= 1) {
       const item = assistantRecent[i];
-      lines.push(`[codex] ${item.text}`);
+      blocks.push(`[codex] ${item.text}`);
     }
 
-    if (lines.length === 0) {
-      return '[codex] Waiting for response...';
+    if (blocks.length === 0) {
+      return ['[codex] Waiting for response...'];
+    }
+    return blocks;
+  }
+
+  #buildContentBudgetAttempts() {
+    const attempts = [];
+    let budget = this.#clampContentBudget(this.currentContentBudget);
+    while (budget > this.minChars) {
+      attempts.push(budget);
+      budget -= this.contentBudgetStep;
+    }
+    attempts.push(this.minChars);
+    return [...new Set(attempts)];
+  }
+
+  #recordContentFlushSuccess(usedBudget) {
+    const normalized = this.#clampContentBudget(usedBudget);
+    if (normalized < this.currentContentBudget) {
+      this.currentContentBudget = normalized;
+      this.contentFlushSuccesses = 0;
+      return;
     }
 
-    return lines.join('\n\n').trim();
+    if (normalized > this.currentContentBudget) {
+      this.currentContentBudget = normalized;
+      this.contentFlushSuccesses = 0;
+      return;
+    }
+
+    this.contentFlushSuccesses += 1;
+    if (
+      this.currentContentBudget < this.maxChars
+      && this.contentFlushSuccesses >= this.contentProbeSuccessesNeeded
+    ) {
+      this.currentContentBudget = Math.min(this.maxChars, this.currentContentBudget + this.contentBudgetStep);
+      this.contentFlushSuccesses = 0;
+    }
+  }
+
+  #recordContentFlushFailure() {
+    this.currentContentBudget = Math.max(this.minChars, this.currentContentBudget - this.contentBudgetStep);
+    this.contentFlushSuccesses = 0;
+  }
+
+  #clampContentBudget(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return this.maxChars;
+    return Math.max(this.minChars, Math.min(this.maxChars, Math.floor(parsed)));
+  }
+
+  #composeContentTextForBudget(budget) {
+    const target = this.#clampContentBudget(budget);
+    const blocks = this.focusMode ? this.#buildFocusBlocks() : this.#buildNormalBlocks();
+    return this.#packBlocks(blocks, target);
+  }
+
+  #packBlocks(blocks, budget) {
+    const sanitized = blocks
+      .map((entry) => String(entry || '').trim())
+      .filter(Boolean);
+    if (sanitized.length === 0) return '';
+
+    const separator = '\n\n';
+    let output = '';
+    let truncated = false;
+
+    for (let i = 0; i < sanitized.length; i += 1) {
+      const block = sanitized[i];
+      const prefix = output ? separator : '';
+      const nextLength = output.length + prefix.length + block.length;
+      if (nextLength <= budget) {
+        output = `${output}${prefix}${block}`;
+        continue;
+      }
+
+      const remaining = budget - output.length - prefix.length;
+      if (remaining > 0) {
+        output = `${output}${prefix}${block.slice(0, remaining)}`;
+      } else if (!output && budget > 0) {
+        output = block.slice(0, budget);
+      }
+      truncated = true;
+      break;
+    }
+
+    if (truncated && output && budget - output.length >= 3) {
+      output = `${output}...`;
+    }
+
+    return output.trim();
   }
 }

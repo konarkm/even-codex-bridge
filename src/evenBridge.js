@@ -253,11 +253,11 @@ export class EvenBridgeController {
   }
 
   async updateContent(text) {
-    if (!this.bridge || !this.initialized) return;
+    if (!this.bridge || !this.initialized) return true;
 
     const content = String(text || '').slice(0, 2000);
     if (content === this.lastContentText) {
-      return;
+      return true;
     }
 
     const updatePayload = {
@@ -269,16 +269,17 @@ export class EvenBridgeController {
     const ok = await this.bridge.textContainerUpgrade(updatePayload);
     if (ok) {
       this.lastContentText = content;
-      return;
+      return true;
     }
 
     await this.bridge.rebuildPageContainer(this.#buildTextContainers(this.lastStatusText || INITIAL_STATUS_TEXT, content));
     const retryOk = await this.bridge.textContainerUpgrade(updatePayload);
     if (retryOk) {
       this.lastContentText = content;
-      return;
+      return true;
     }
     this.logger?.warn?.('content textContainerUpgrade failed after rebuild retry');
+    return false;
   }
 
   async updateText(text) {
