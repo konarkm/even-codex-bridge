@@ -19,7 +19,9 @@ const PORT = Number(process.env.PORT || 8788);
 const CLIENT_SHARED_TOKEN = process.env.CLIENT_SHARED_TOKEN;
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const CODEX_CWD = process.env.CODEX_CWD || process.cwd();
-const CODEX_MODEL = process.env.CODEX_MODEL || 'gpt-5-codex';
+const CODEX_MODEL = process.env.CODEX_MODEL || 'gpt-5.3-codex';
+const CODEX_MAIN_MODEL = process.env.CODEX_MAIN_MODEL || CODEX_MODEL;
+const CODEX_FAST_MODEL = process.env.CODEX_FAST_MODEL || 'gpt-5.3-codex-spark';
 const STT_PROVIDER = process.env.STT_PROVIDER || 'none';
 const STT_API_KEY = process.env.STT_API_KEY || '';
 const STT_LANGUAGE = process.env.STT_LANGUAGE || 'en';
@@ -95,7 +97,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     ts: Date.now(),
-    model: CODEX_MODEL,
+    model: CODEX_MAIN_MODEL,
     sttProvider: STT_PROVIDER,
   });
 });
@@ -233,7 +235,8 @@ wss.on('connection', (ws, req) => {
     logger: createLogger(`codex-${clientId.slice(0, 6)}`),
     codexBin: CODEX_BIN,
     codexCwd: CODEX_CWD,
-    model: CODEX_MODEL,
+    mainModel: CODEX_MAIN_MODEL,
+    fastModel: CODEX_FAST_MODEL,
     approvalPolicy: 'never',
     sandboxPolicy: { type: 'dangerFullAccess' },
     sttProvider: STT_PROVIDER,
@@ -247,6 +250,10 @@ wss.on('connection', (ws, req) => {
     sttVadSilenceThresholdSecs: STT_VAD_SILENCE_THRESHOLD_SECS,
     enableDefaultThreadResume: ENABLE_DEFAULT_THREAD_RESUME,
     enablePersistThreadState: ENABLE_PERSIST_THREAD_STATE,
+    persistedModelState: threadStateStore.getModelState(),
+    onModelStateChange: (modelState) => {
+      threadStateStore.setModelState(modelState);
+    },
     onRestartRequested: (target) => {
       scheduleProcessRestart(target, clientId);
     },
@@ -504,7 +511,8 @@ process.on('SIGTERM', () => {
 server.listen(PORT, '0.0.0.0', () => {
   logger.info('Even Codex bridge server started', {
     port: PORT,
-    model: CODEX_MODEL,
+    model: CODEX_MAIN_MODEL,
+    fastModel: CODEX_FAST_MODEL,
     sttProvider: STT_PROVIDER,
     sttModelId: STT_MODEL_ID,
     sttVadTuning: {

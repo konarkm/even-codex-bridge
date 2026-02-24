@@ -79,3 +79,31 @@ test('parseSlashCommand strips punctuation from thread action', () => {
     supported: true,
   });
 });
+
+test('parseSlashCommand supports spark and fast toggle commands', () => {
+  const spark = parseSlashCommand('/spark');
+  assert.deepEqual(spark, {
+    name: 'spark',
+    args: [],
+    raw: '/spark',
+    supported: true,
+  });
+
+  const fast = parseSlashCommand('slash fast.');
+  assert.deepEqual(fast, {
+    name: 'fast',
+    args: [],
+    raw: 'slash fast.',
+    supported: true,
+  });
+});
+
+test('parseSlashCommand supports effort command with multi-token args', () => {
+  const parsed = parseSlashCommand('/effort ex high');
+  assert.deepEqual(parsed, {
+    name: 'effort',
+    args: ['ex', 'high'],
+    raw: '/effort ex high',
+    supported: true,
+  });
+});

@@ -20,12 +20,75 @@ function mergeDeltaText(previous, incoming) {
   return `${prev}${next}`;
 }
 
+const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+
+function normalizeReasoningEffort(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return REASONING_EFFORTS.has(normalized) ? normalized : null;
+}
+
+function normalizeReasoningEffortInput(value) {
+  const compact = String(value || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+  if (!compact) return null;
+
+  if (compact === 'xhigh' || compact === 'exhigh' || compact === 'extrahigh') {
+    return 'xhigh';
+  }
+
+  return normalizeReasoningEffort(compact);
+}
+
+function normalizeModel(value) {
+  const model = String(value || '').trim();
+  return model || null;
+}
+
+function normalizeEffortByModel(value) {
+  if (!value || typeof value !== 'object') {
+    return {};
+  }
+
+  const normalized = {};
+  for (const [modelRaw, effortRaw] of Object.entries(value)) {
+    const model = normalizeModel(modelRaw);
+    const effort = normalizeReasoningEffort(effortRaw);
+    if (!model || !effort) continue;
+    normalized[model] = effort;
+  }
+  return normalized;
+}
+
+function normalizeFastReturnTarget(value) {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const model = normalizeModel(value.model);
+  const effort = normalizeReasoningEffort(value.effort);
+  if (!model || !effort) {
+    return null;
+  }
+
+  return { model, effort };
+}
+
 class CodexSessionBridge {
   constructor(options) {
     this.logger = options.logger;
     this.codexBin = options.codexBin || 'codex';
     this.codexCwd = options.codexCwd || process.cwd();
-    this.model = options.model || 'gpt-5-codex';
+    this.mainModel = options.mainModel || options.model || 'gpt-5.3-codex';
+    this.fastModel = options.fastModel || 'gpt-5.3-codex-spark';
+    const persistedModelState = options.persistedModelState || {};
+    this.model = normalizeModel(persistedModelState.activeModel) || this.mainModel;
+    this.effortByModel = normalizeEffortByModel(persistedModelState.effortByModel);
+    this.fastReturnTarget = normalizeFastReturnTarget(persistedModelState.fastReturnTarget);
+    this.onModelStateChange = typeof options.onModelStateChange === 'function'
+      ? options.onModelStateChange
+      : null;
+    this.#setDefaultEffortForModel(this.mainModel, 'medium');
+    this.#setDefaultEffortForModel(this.fastModel, 'xhigh');
+    this.#setDefaultEffortForModel(this.model, 'medium');
     this.approvalPolicy = options.approvalPolicy || 'never';
     this.sandboxPolicy = options.sandboxPolicy || { type: 'dangerFullAccess' };
     this.sttProvider = String(options.sttProvider || 'none').toLowerCase();
@@ -202,6 +265,7 @@ class CodexSessionBridge {
         threadId: this.threadId,
         input: [asTextInput(text)],
         model: this.model,
+        effort: this.#getCurrentEffort(),
         approvalPolicy: this.approvalPolicy,
         sandboxPolicy: this.sandboxPolicy,
         cwd: this.codexCwd,
@@ -220,6 +284,7 @@ class CodexSessionBridge {
         threadId: this.threadId,
         input: [asTextInput(text)],
         model: this.model,
+        effort: this.#getCurrentEffort(),
         approvalPolicy: this.approvalPolicy,
         sandboxPolicy: this.sandboxPolicy,
         cwd: this.codexCwd,
@@ -802,6 +867,9 @@ class CodexSessionBridge {
           '/reset - start a fresh thread',
           '/debug - show current turn diagnostics',
           '/compact - request thread compaction',
+          '/effort [none|minimal|low|medium|high|xhigh] - view or set effort for current model',
+          '/spark - toggle fast model on or off',
+          '/fast - alias for /spark',
           '/restart <codex|bridge|both> - restart runtime components',
           '/thread - show thread and active turn',
           '/thread new - start a new thread',
@@ -830,6 +898,14 @@ class CodexSessionBridge {
 
     if (command.name === 'compact') {
       return this.#handleCompactCommand(state, callbacks);
+    }
+
+    if (command.name === 'effort') {
+      return this.#handleEffortCommand(callbacks, command.args);
+    }
+
+    if (command.name === 'spark' || command.name === 'fast') {
+      return this.#handleSparkToggleCommand(callbacks);
     }
 
     if (command.name === 'thread') {
@@ -906,6 +982,10 @@ class CodexSessionBridge {
       `thread: ${state.threadId || this.threadId || '(none)'}`,
       `active_turn: ${state.activeTurnId || '(none)'}`,
       `model: ${this.model}`,
+      `effort: ${this.#getCurrentEffort()}`,
+      `fast_mode: ${this.#isFastModel(this.model)}`,
+      `main_model: ${this.mainModel}`,
+      `fast_model: ${this.fastModel}`,
       `stt_provider: ${this.sttProvider}`,
       `transport_lost: ${this.transportLost}`,
       `resume_default: ${this.enableDefaultThreadResume}`,
@@ -924,9 +1004,118 @@ class CodexSessionBridge {
       `transport_lost: ${this.transportLost}`,
       `recovering: ${recovering}`,
       `draft_items: ${draftCount}`,
+      `model: ${this.model}`,
+      `effort: ${this.#getCurrentEffort()}`,
       `stt_provider: ${this.sttProvider}`,
       `stt_model: ${this.sttModelId}`,
     ].join('\n');
+  }
+
+  #setDefaultEffortForModel(model, fallbackEffort) {
+    const normalizedModel = normalizeModel(model);
+    const normalizedEffort = normalizeReasoningEffort(fallbackEffort);
+    if (!normalizedModel || !normalizedEffort) return;
+    if (!this.effortByModel[normalizedModel]) {
+      this.effortByModel[normalizedModel] = normalizedEffort;
+    }
+  }
+
+  #getEffortForModel(model) {
+    const normalizedModel = normalizeModel(model);
+    if (!normalizedModel) return 'medium';
+    const saved = normalizeReasoningEffort(this.effortByModel[normalizedModel]);
+    if (saved) return saved;
+    return normalizedModel === this.fastModel ? 'xhigh' : 'medium';
+  }
+
+  #getCurrentEffort() {
+    return this.#getEffortForModel(this.model);
+  }
+
+  #isFastModel(model) {
+    return normalizeModel(model) === this.fastModel;
+  }
+
+  #persistModelState() {
+    if (!this.onModelStateChange) return;
+
+    try {
+      this.onModelStateChange({
+        activeModel: this.model,
+        effortByModel: { ...this.effortByModel },
+        fastReturnTarget: this.fastReturnTarget ? { ...this.fastReturnTarget } : null,
+      });
+    } catch (error) {
+      this.logger?.warn?.('model_state_persist_failed', {
+        message: error?.message || String(error),
+      });
+    }
+  }
+
+  #toggleSparkModel() {
+    if (this.#isFastModel(this.model)) {
+      const target = this.fastReturnTarget;
+      this.fastReturnTarget = null;
+      const nextModel = normalizeModel(target?.model) || this.mainModel;
+      const nextEffort = normalizeReasoningEffort(target?.effort) || this.#getEffortForModel(nextModel);
+      this.model = nextModel;
+      this.effortByModel[nextModel] = nextEffort;
+      this.#persistModelState();
+      return {
+        enabled: false,
+        model: this.model,
+        effort: this.#getCurrentEffort(),
+      };
+    }
+
+    this.fastReturnTarget = {
+      model: this.model,
+      effort: this.#getCurrentEffort(),
+    };
+    this.model = this.fastModel;
+    this.effortByModel[this.fastModel] = this.#getEffortForModel(this.fastModel);
+    this.#persistModelState();
+    return {
+      enabled: true,
+      model: this.model,
+      effort: this.#getCurrentEffort(),
+    };
+  }
+
+  #handleSparkToggleCommand(callbacks) {
+    const toggled = this.#toggleSparkModel();
+    this.#emitCommandText(
+      callbacks,
+      toggled.enabled
+        ? `Fast mode enabled.\nModel: ${toggled.model}\nEffort: ${toggled.effort}`
+        : `Fast mode disabled.\nModel: ${toggled.model}\nEffort: ${toggled.effort}`,
+    );
+    return true;
+  }
+
+  #handleEffortCommand(callbacks, args = []) {
+    if (!args.length) {
+      this.#emitCommandText(
+        callbacks,
+        `Model: ${this.model}\nEffort: ${this.#getCurrentEffort()}\nAllowed efforts: none, minimal, low, medium, high, xhigh`,
+      );
+      return true;
+    }
+
+    const effortRaw = args.join(' ');
+    const effort = normalizeReasoningEffortInput(effortRaw);
+    if (!effort) {
+      this.#emitCommandText(callbacks, 'Usage: /effort <none|minimal|low|medium|high|xhigh>');
+      return true;
+    }
+
+    this.effortByModel[this.model] = effort;
+    this.#persistModelState();
+    this.#emitCommandText(
+      callbacks,
+      `Reasoning effort set.\nModel: ${this.model}\nEffort: ${effort}`,
+    );
+    return true;
   }
 
   async #handleStopCommand(state, callbacks) {

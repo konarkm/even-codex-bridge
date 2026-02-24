@@ -34,11 +34,14 @@ This repo is configured for YOLO mode:
 - `VITE_CLIENT_SHARED_TOKEN` (must match exactly)
 - `CODEX_CWD`
 - `VITE_WS_BASE_URL`
-3. Optional thread persistence (recommended):
+3. Optional model toggle config:
+- `CODEX_MAIN_MODEL` (default: `gpt-5.3-codex`; legacy fallback: `CODEX_MODEL`)
+- `CODEX_FAST_MODEL` (default: `gpt-5.3-codex-spark`)
+4. Optional thread persistence (recommended):
 - `ENABLE_DEFAULT_THREAD_RESUME=1`
 - `ENABLE_PERSIST_THREAD_STATE=1`
 - `THREAD_STATE_FILE=.runtime/thread-state.json`
-4. STT configuration:
+5. STT configuration:
 - `STT_PROVIDER=elevenlabs`
 - `STT_API_KEY=<your key>`
 - `STT_MODEL_ID=scribe_v2_realtime`
@@ -153,6 +156,9 @@ Accepted in `text.submit` as either typed slash or spoken "slash":
 - `/stop` or `slash stop`
 - `/reset` or `slash reset`
 - `/compact` or `slash compact`
+- `/effort` or `slash effort`
+- `/spark` or `slash spark`
+- `/fast` or `slash fast`
 - `/restart codex` or `slash restart codex`
 - `/restart bridge` or `slash restart bridge`
 - `/restart both` or `slash restart both`
@@ -169,6 +175,10 @@ Behavior:
 - During compaction lifecycle, bridge emits:
   - `Compaction started.`
   - `Compaction complete.`
+- `effort`: without args shows current model/effort; with arg sets effort for current model.
+  - Allowed values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`
+  - STT aliases like `ex high` / `extra high` normalize to `xhigh`
+- `spark`/`fast`: toggle between current model and configured fast model, restoring prior model+effort on toggle off.
 - `restart codex`: restarts only Codex app-server in-process, attempts thread resume, then falls back to a fresh thread.
 - `restart bridge`: exits server with code `42`; supervised launcher restarts process.
 - `restart both`: same process restart path as `restart bridge`.

@@ -6,6 +6,9 @@ const SUPPORTED_COMMANDS = new Set([
   'debug',
   'thread',
   'compact',
+  'effort',
+  'spark',
+  'fast',
   'restart',
 ]);
 
