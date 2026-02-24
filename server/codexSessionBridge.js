@@ -36,6 +36,9 @@ class CodexSessionBridge {
     this.rpc = null;
     this.stt = null;
     this.threadId = null;
+    this.clientVersion = '0.1.0';
+    this.transportLost = false;
+    this.recoverPromise = null;
     this.supportsTurnSteer = true;
     this.itemDrafts = new Map();
   }
@@ -48,58 +51,11 @@ class CodexSessionBridge {
       detail: 'Starting Codex app-server session',
     });
 
-    this.rpc = new CodexRpcClient({
-      codexBin: this.codexBin,
-      cwd: this.codexCwd,
-      clientName: 'even_codex_bridge',
-      clientTitle: 'Even Codex Bridge',
-      clientVersion: startPayload?.appVersion || '0.1.0',
-    });
+    this.clientVersion = startPayload?.appVersion || this.clientVersion || '0.1.0';
+    this.transportLost = false;
 
-    this.rpc.on('notification', (event) => {
-      this.#handleNotification(state, callbacks, event).catch((error) => {
-        callbacks.onError({
-          code: 'notification_handler_error',
-          message: error?.message || String(error),
-          recoverable: true,
-        });
-      });
-    });
-
-    this.rpc.on('serverRequest', (event) => {
-      this.#handleServerRequest(state, callbacks, event).catch((error) => {
-        callbacks.onError({
-          code: 'server_request_handler_error',
-          message: error?.message || String(error),
-          recoverable: true,
-        });
-      });
-    });
-
-    this.rpc.on('stderr', (chunk) => {
-      this.logger.warn('codex_stderr', {
-        clientId: state.clientId,
-        chunk: String(chunk).trim(),
-      });
-    });
-
-    await this.rpc.start();
-
-    const threadRaw = await this.rpc.request('thread/start', {
-      model: this.model,
-      cwd: this.codexCwd,
-      approvalPolicy: this.approvalPolicy,
-      sandbox: 'danger-full-access',
-      experimentalRawEvents: false,
-    });
-
-    const threadId = threadRaw?.thread?.id;
-    if (!threadId) {
-      throw new Error('Invalid thread/start response from Codex app-server');
-    }
-
-    this.threadId = threadId;
-    state.markRunning(threadId);
+    await this.#createAndStartRpc(state, callbacks);
+    await this.#startThread(state, callbacks);
 
     await this.#startStt(state, callbacks);
 
@@ -129,6 +85,8 @@ class CodexSessionBridge {
     }
 
     this.threadId = null;
+    this.transportLost = false;
+    this.recoverPromise = null;
     this.itemDrafts.clear();
     state.markStopped();
 
@@ -144,13 +102,20 @@ class CodexSessionBridge {
     const text = String(rawText || '').trim();
     if (!text) return false;
 
-    if (!state.running || !this.rpc || !this.threadId) {
+    if (!state.running) {
       callbacks.onError({
         code: 'session_not_running',
         message: 'Cannot submit text because Codex session is not running',
         recoverable: true,
       });
       return false;
+    }
+
+    if (!this.rpc || !this.threadId || this.transportLost) {
+      const recovered = await this.#recoverRpcAndThread(state, callbacks, 'submit');
+      if (!recovered || !this.rpc || !this.threadId) {
+        return false;
+      }
     }
 
     if (state.activeTurnId && this.supportsTurnSteer) {
@@ -190,7 +155,14 @@ class CodexSessionBridge {
           message: error?.message || String(error),
           recoverable: true,
         });
-        return false;
+        // Align with iMessage bridge behavior: if steer fails for a transient
+        // runtime reason, clear active turn and fall back to a fresh turn/start.
+        state.clearActiveTurn();
+        callbacks.onStatus({
+          phase: 'turn_steer_fallback',
+          detail: 'turn/steer failed; falling back to turn/start',
+          sessionId: this.threadId,
+        });
       }
     }
 
@@ -203,14 +175,35 @@ class CodexSessionBridge {
       return false;
     }
 
-    const turnRaw = await this.rpc.request('turn/start', {
-      threadId: this.threadId,
-      input: [asTextInput(text)],
-      model: this.model,
-      approvalPolicy: this.approvalPolicy,
-      sandboxPolicy: this.sandboxPolicy,
-      cwd: this.codexCwd,
-    }, 120000);
+    let turnRaw;
+    try {
+      turnRaw = await this.rpc.request('turn/start', {
+        threadId: this.threadId,
+        input: [asTextInput(text)],
+        model: this.model,
+        approvalPolicy: this.approvalPolicy,
+        sandboxPolicy: this.sandboxPolicy,
+        cwd: this.codexCwd,
+      }, 120000);
+    } catch (error) {
+      if (!this.#isRecoverableSessionError(error)) {
+        throw error;
+      }
+
+      const recovered = await this.#recoverRpcAndThread(state, callbacks, 'turn_start');
+      if (!recovered || !this.rpc || !this.threadId) {
+        return false;
+      }
+
+      turnRaw = await this.rpc.request('turn/start', {
+        threadId: this.threadId,
+        input: [asTextInput(text)],
+        model: this.model,
+        approvalPolicy: this.approvalPolicy,
+        sandboxPolicy: this.sandboxPolicy,
+        cwd: this.codexCwd,
+      }, 120000);
+    }
 
     const turnId = turnRaw?.turn?.id;
     if (!turnId) {
@@ -322,6 +315,183 @@ class CodexSessionBridge {
     });
 
     await this.stt.start();
+  }
+
+  async #createAndStartRpc(state, callbacks) {
+    const rpc = new CodexRpcClient({
+      codexBin: this.codexBin,
+      cwd: this.codexCwd,
+      clientName: 'even_codex_bridge',
+      clientTitle: 'Even Codex Bridge',
+      clientVersion: this.clientVersion,
+    });
+
+    this.rpc = rpc;
+    this.#wireRpcHandlers(rpc, state, callbacks);
+    await rpc.start();
+    this.transportLost = false;
+  }
+
+  async #startThread(state, callbacks) {
+    if (!this.rpc) {
+      throw new Error('Codex RPC is not ready');
+    }
+
+    const makeThreadStartParams = () => ({
+      model: this.model,
+      cwd: this.codexCwd,
+      approvalPolicy: this.approvalPolicy,
+      sandbox: 'danger-full-access',
+      experimentalRawEvents: false,
+    });
+
+    let threadRaw;
+    try {
+      threadRaw = await this.rpc.request('thread/start', makeThreadStartParams());
+    } catch (error) {
+      if (!this.#isThreadStartTimeout(error)) {
+        throw error;
+      }
+
+      callbacks.onStatus({
+        phase: 'recovering',
+        detail: 'thread/start timed out; restarting Codex app-server',
+        sessionId: this.threadId,
+      });
+
+      await this.#restartRpcOnly(state, callbacks);
+      if (!this.rpc) {
+        throw new Error('Codex RPC restart failed');
+      }
+      threadRaw = await this.rpc.request('thread/start', makeThreadStartParams());
+    }
+
+    const threadId = threadRaw?.thread?.id;
+    if (!threadId) {
+      throw new Error('Invalid thread/start response from Codex app-server');
+    }
+
+    this.threadId = threadId;
+    this.transportLost = false;
+    state.markRunning(threadId);
+    state.clearActiveTurn();
+  }
+
+  #wireRpcHandlers(rpc, state, callbacks) {
+    rpc.on('notification', (event) => {
+      this.#handleNotification(state, callbacks, event).catch((error) => {
+        callbacks.onError({
+          code: 'notification_handler_error',
+          message: error?.message || String(error),
+          recoverable: true,
+        });
+      });
+    });
+
+    rpc.on('serverRequest', (event) => {
+      this.#handleServerRequest(state, callbacks, event).catch((error) => {
+        callbacks.onError({
+          code: 'server_request_handler_error',
+          message: error?.message || String(error),
+          recoverable: true,
+        });
+      });
+    });
+
+    rpc.on('stderr', (chunk) => {
+      this.logger.warn('codex_stderr', {
+        clientId: state.clientId,
+        chunk: String(chunk).trim(),
+      });
+    });
+
+    rpc.on('exit', ({ code, signal }) => {
+      this.#handleRpcTransportLoss(
+        state,
+        callbacks,
+        rpc,
+        `codex app-server exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`,
+      );
+    });
+
+    rpc.on('error', (error) => {
+      this.#handleRpcTransportLoss(state, callbacks, rpc, error?.message || String(error));
+    });
+  }
+
+  #handleRpcTransportLoss(state, callbacks, rpc, message) {
+    if (this.rpc !== rpc) return;
+
+    this.transportLost = true;
+    this.threadId = null;
+    this.itemDrafts.clear();
+    state.threadId = null;
+    state.clearActiveTurn();
+
+    callbacks.onStatus({
+      phase: 'codex_disconnected',
+      detail: 'Codex app-server disconnected; attempting recovery on next input',
+      sessionId: null,
+    });
+
+    callbacks.onError({
+      code: 'codex_transport_closed',
+      message: message || 'Codex app-server transport closed',
+      recoverable: true,
+    });
+  }
+
+  async #restartRpcOnly(state, callbacks) {
+    const oldRpc = this.rpc;
+    this.rpc = null;
+    this.transportLost = true;
+
+    if (oldRpc) {
+      try {
+        await oldRpc.stop();
+      } catch {
+        // Ignore cleanup errors.
+      }
+      oldRpc.removeAllListeners();
+    }
+
+    await this.#createAndStartRpc(state, callbacks);
+  }
+
+  async #recoverRpcAndThread(state, callbacks, reason) {
+    if (this.recoverPromise) {
+      return this.recoverPromise;
+    }
+
+    this.recoverPromise = (async () => {
+      callbacks.onStatus({
+        phase: 'recovering',
+        detail: `Recovering Codex session (${reason})`,
+        sessionId: this.threadId,
+      });
+
+      try {
+        await this.#restartRpcOnly(state, callbacks);
+        await this.#startThread(state, callbacks);
+        callbacks.onStatus({
+          phase: 'running',
+          detail: 'Codex session recovered',
+          sessionId: this.threadId,
+        });
+        return true;
+      } catch (error) {
+        callbacks.onError({
+          code: 'codex_recovery_failed',
+          message: error?.message || String(error),
+          recoverable: true,
+        });
+        return false;
+      } finally {
+        this.recoverPromise = null;
+      }
+    })();
+
+    return this.recoverPromise;
   }
 
   async #handleNotification(state, callbacks, event) {
@@ -473,6 +643,22 @@ class CodexSessionBridge {
     return (
       lower.includes('unknown variant `turn/steer`') ||
       (lower.includes('unknown method') && lower.includes('turn/steer'))
+    );
+  }
+
+  #isThreadStartTimeout(error) {
+    return String(error?.message || '').includes('RPC request timed out: thread/start');
+  }
+
+  #isRecoverableSessionError(error) {
+    const message = String(error?.message || '').toLowerCase();
+    return (
+      message.includes('codex app-server stopped') ||
+      message.includes('codex app-server exited') ||
+      message.includes('codex app-server is not started') ||
+      message.includes('transport channel closed') ||
+      message.includes('thread not found') ||
+      message.includes('rpc request timed out: turn/start')
     );
   }
 }
