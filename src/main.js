@@ -115,6 +115,10 @@ let micState = MIC_LISTENING;
 let muteReason = MUTE_REASON_NONE;
 let focusMode = false;
 let connectionState = CONNECTION_UNKNOWN;
+const FLOW_IDLE = 'idle';
+const FLOW_UP = 'up';
+const FLOW_DOWN = 'down';
+let flowState = FLOW_IDLE;
 
 function refreshMicToggleButton() {
   if (!els.micToggleBtn) return;
@@ -161,6 +165,7 @@ function stopPingLoop() {
 function updateRendererModeState() {
   renderer.setMicState(micState);
   renderer.setConnectionState(connectionState);
+  renderer.setFlowState(flowState);
   renderer.setFocusMode(focusMode);
 }
 
@@ -289,6 +294,18 @@ function setConnectionState(nextState) {
   renderer.setConnectionState(connectionState);
 }
 
+function setFlowState(nextState, source) {
+  const normalized = nextState || FLOW_IDLE;
+  if (flowState === normalized) return;
+
+  flowState = normalized;
+  renderer.setFlowState(flowState);
+  logger.debug('Flow state updated', {
+    source,
+    flowState,
+  });
+}
+
 async function handleUiEvent(uiEvent) {
   const eventType = Number(uiEvent?.eventType);
   if (!Number.isFinite(eventType)) return;
@@ -332,6 +349,7 @@ async function handleUiEvent(uiEvent) {
 wsClient.addEventListener('open', () => {
   logger.info('WebSocket open');
   setConnectionState(CONNECTION_CONNECTED);
+  setFlowState(FLOW_IDLE, 'ws_open');
   setStatus('Connected to backend');
   renderer.setStatus('Connected to backend');
 
@@ -365,6 +383,7 @@ wsClient.addEventListener('close', (event) => {
   });
   stopPingLoop();
   setConnectionState(CONNECTION_DISCONNECTED);
+  setFlowState(FLOW_IDLE, 'ws_close');
   setStatus('Backend disconnected');
   renderer.setStatus('Backend disconnected. Reconnecting...');
   if (els.submitBtn) {
@@ -379,6 +398,7 @@ wsClient.addEventListener('close', (event) => {
 wsClient.addEventListener('reconnecting', (event) => {
   const { attempt, delay } = event.detail;
   setConnectionState(CONNECTION_RECONNECTING);
+  setFlowState(FLOW_IDLE, 'ws_reconnecting');
   setStatus(`Reconnecting (attempt ${attempt})...`);
   renderer.setStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s`);
 
@@ -390,6 +410,7 @@ wsClient.addEventListener('reconnecting', (event) => {
 wsClient.addEventListener('error', (event) => {
   logger.error('WebSocket error', event.detail);
   setConnectionState(CONNECTION_ERROR);
+  setFlowState(FLOW_IDLE, 'ws_error');
   setStatus(`WebSocket error: ${event.detail.message}`);
   renderer.setStatus(`WebSocket error: ${event.detail.message}`);
 
@@ -413,6 +434,9 @@ wsClient.addEventListener('message', (event) => {
         phase,
         detail: msg.payload?.detail || null,
       });
+      if (phase === 'turn_completed') {
+        setFlowState(FLOW_IDLE, 'status_turn_completed');
+      }
       setStatus(text);
       renderer.setStatus(text);
       break;
@@ -424,6 +448,9 @@ wsClient.addEventListener('message', (event) => {
         textLength: String(msg.payload?.text || '').length,
         replace: Boolean(msg.payload?.replace),
       });
+      if ((msg.payload?.role || 'assistant') === 'assistant' && String(msg.payload?.text || '').trim()) {
+        setFlowState(FLOW_DOWN, 'assistant_delta');
+      }
       renderer.applyTranscriptDelta(msg.payload);
       break;
     case 'transcript.final':
@@ -432,6 +459,13 @@ wsClient.addEventListener('message', (event) => {
         turnId: msg.payload?.turnId || null,
         textLength: String(msg.payload?.text || '').length,
       });
+      if ((msg.payload?.role || 'assistant') === 'user') {
+        setFlowState(FLOW_UP, 'user_final');
+      } else {
+        // Keep "downstream streaming" active across interleaved assistant outputs.
+        // We only return to idle when turn_completed arrives.
+        setFlowState(FLOW_DOWN, 'assistant_final');
+      }
       renderer.applyTranscriptFinal(msg.payload);
       break;
     case 'metrics':
@@ -440,6 +474,7 @@ wsClient.addEventListener('message', (event) => {
     case 'error': {
       const errorText = `${msg.payload?.code || 'error'}: ${msg.payload?.message || 'Unknown error'}`;
       logger.error('Backend error', msg.payload);
+      setFlowState(FLOW_IDLE, 'backend_error');
       setStatus(errorText);
       renderer.setStatus(errorText);
       break;
@@ -469,6 +504,7 @@ async function startAssistant() {
   muteReason = MUTE_REASON_NONE;
   focusMode = false;
   connectionState = CONNECTION_UNKNOWN;
+  flowState = FLOW_IDLE;
   updateRendererModeState();
 
   setStatus('Initializing Even bridge...');
@@ -535,6 +571,7 @@ async function stopAssistant() {
 
   started = false;
   lastDoubleClickEventAt = 0;
+  setFlowState(FLOW_IDLE, 'stop');
 
   sendSessionStop('user_requested_stop', 'stopAssistant');
 
@@ -566,6 +603,7 @@ async function stopAssistant() {
   muteReason = MUTE_REASON_NONE;
   focusMode = false;
   connectionState = CONNECTION_UNKNOWN;
+  flowState = FLOW_IDLE;
   refreshMicToggleButton();
 
   setStatus('Stopped');
@@ -586,6 +624,7 @@ function teardownBestEffort() {
 
   started = false;
   lastDoubleClickEventAt = 0;
+  setFlowState(FLOW_IDLE, 'teardown');
 
   sendSessionStop('window_unload', 'beforeunload');
   wsClient.disconnect();
@@ -670,6 +709,7 @@ function submitManualText() {
     els.manualText.value = '';
   }
 
+  setFlowState(FLOW_UP, 'manual_text_submit');
   logger.info('Manual text submitted');
 }
 

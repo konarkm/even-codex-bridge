@@ -8,20 +8,34 @@ const STATUS_CONTAINER_ID = 1;
 const STATUS_CONTAINER_NAME = 'ambient-status';
 const CONTENT_CONTAINER_ID = 2;
 const CONTENT_CONTAINER_NAME = 'ambient-main';
-const INITIAL_STATUS_TEXT = 'Starting Codex bridge...';
+const INITIAL_STATUS_TEXT = 'listening | init | starting';
 const INITIAL_CONTENT_TEXT = '';
 const STATUS_CONTAINER_FRAME = {
   xPosition: 0,
   yPosition: 0,
   width: 576,
-  height: 30,
+  height: 46,
+  borderWidth: 0,
+  borderColor: 7,
+  borderRdaius: 0,
+  paddingLength: 6,
 };
 const CONTENT_CONTAINER_FRAME = {
   xPosition: 0,
-  yPosition: 30,
+  yPosition: 48,
   width: 576,
-  height: 258,
+  height: 240,
+  borderWidth: 1,
+  borderColor: 7,
+  borderRdaius: 2,
+  paddingLength: 6,
 };
+const STATUS_MAX_CHARS = 56;
+
+function normalizeStatusSegment(value, maxChars) {
+  const compact = String(value || '').replace(/\s+/g, ' ').trim();
+  return compact.slice(0, maxChars);
+}
 
 function normalizeStartResult(raw) {
   if (typeof raw === 'number') return raw;
@@ -182,10 +196,15 @@ export class EvenBridgeController {
     }
   }
 
-  async updateStatus(text) {
+  async updateStatus(status) {
     if (!this.bridge || !this.initialized) return;
 
-    const content = String(text || '').slice(0, 400);
+    const content = normalizeStatusSegment(
+      status && typeof status === 'object'
+        ? `${status.mic || 'listening'} | ${status.connection || 'init'}${status.activity ? ` | ${status.activity}` : ''}`
+        : status || '',
+      STATUS_MAX_CHARS,
+    );
     if (content === this.lastStatusText) return;
 
     const updatePayload = {
@@ -250,7 +269,7 @@ export class EvenBridgeController {
           ...STATUS_CONTAINER_FRAME,
           containerID: STATUS_CONTAINER_ID,
           containerName: STATUS_CONTAINER_NAME,
-          content: String(statusContent || '').slice(0, 400),
+          content: normalizeStatusSegment(statusContent, STATUS_MAX_CHARS),
           isEventCapture: 0,
         },
         {

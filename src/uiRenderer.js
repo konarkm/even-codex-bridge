@@ -1,5 +1,6 @@
 import {
   MIC_LISTENING,
+  MIC_MUTED,
   compactStatusLabel,
 } from './uxState.mjs';
 
@@ -16,6 +17,35 @@ export function mergeDeltaText(previous, incoming) {
   return `${prev}${next}`;
 }
 
+function shortenStatus(text) {
+  const source = String(text || '').trim();
+  if (!source) return '';
+
+  const lowered = source.toLowerCase();
+  if (lowered.includes('mic muted')) return 'muted';
+  if (lowered.includes('mic listening')) return 'listening';
+  if (lowered.includes('stt session started')) return 'stt on';
+  if (lowered.includes('stt connected')) return 'stt';
+  if (lowered.includes('codex bridge ready')) return 'ready';
+  if (lowered.includes('connected to backend')) return 'ready';
+  if (lowered.includes('initializing even bridge')) return 'init';
+  if (lowered.includes('turn completed')) return 'done';
+  if (lowered.includes('turn started')) return 'turn';
+  if (lowered.includes('thinking')) return 'think';
+  if (lowered.includes('reconnecting')) return 'reconn';
+  if (lowered.includes('backend disconnected')) return 'offline';
+  if (lowered.includes('websocket error')) return 'ws error';
+  if (lowered.includes('manual text submitted')) return 'text';
+  if (lowered.includes('stt text submitted')) return 'speech';
+
+  const head = source.split(/[|-]/)[0] || source;
+  return head
+    .replace(/[_\s]+/g, ' ')
+    .trim()
+    .slice(0, 12)
+    .toLowerCase();
+}
+
 export class UiRenderer {
   constructor(options) {
     this.evenBridge = options.evenBridge;
@@ -26,6 +56,7 @@ export class UiRenderer {
     this.statusText = 'Initializing...';
     this.micState = options.micState || MIC_LISTENING;
     this.connectionState = options.connectionState || 'unknown';
+    this.flowState = options.flowState || 'idle';
     this.focusMode = false;
 
     this.userLiveText = '';
@@ -49,6 +80,7 @@ export class UiRenderer {
     this.statusText = 'Initializing...';
     this.micState = MIC_LISTENING;
     this.connectionState = 'unknown';
+    this.flowState = 'idle';
     this.focusMode = false;
 
     this.userLiveText = '';
@@ -75,6 +107,11 @@ export class UiRenderer {
 
   setConnectionState(connectionState) {
     this.connectionState = connectionState || 'unknown';
+    this.#scheduleRender();
+  }
+
+  setFlowState(flowState) {
+    this.flowState = flowState || 'idle';
     this.#scheduleRender();
   }
 
@@ -154,14 +191,14 @@ export class UiRenderer {
   }
 
   async flushNow() {
-    const statusText = this.#composeStatusText();
+    const status = this.#composeStatusLine();
     const contentText = this.#composeContentText();
 
-    await this.evenBridge.updateStatus(statusText);
+    await this.evenBridge.updateStatus(status);
     await this.evenBridge.updateContent(contentText);
 
     this.logger?.debug?.('Renderer flush', {
-      statusLength: statusText.length,
+      statusLength: String(status || '').length,
       contentLength: contentText.length,
       focusMode: this.focusMode,
     });
@@ -207,21 +244,40 @@ export class UiRenderer {
     }, this.userLiveStaleMs);
   }
 
-  #composeStatusText() {
+  #composeStatusLine() {
     const compact = compactStatusLabel({
       micState: this.micState,
       connectionState: this.connectionState,
     });
-
-    if (this.focusMode) {
-      return compact;
+    const [, connectionRaw = 'initializing'] = compact.split(' | ');
+    const micGlyph = this.micState === MIC_MUTED ? '○' : '●';
+    const connectionGlyph = connectionRaw === 'connected' ? '■' : '□';
+    const flowGlyphMap = {
+      up: '↑',
+      down: '↓',
+      idle: '·',
+    };
+    const flowGlyph = flowGlyphMap[this.flowState] || '·';
+    const activity = shortenStatus(this.statusText);
+    let text = 'idle';
+    if (this.flowState === 'up') {
+      text = 'sending';
+    } else if (this.flowState === 'down') {
+      text = 'streaming';
+    } else if (this.micState === MIC_MUTED) {
+      text = 'muted';
+    } else if (connectionRaw === 'reconnecting') {
+      text = 'reconnecting';
+    } else if (connectionRaw === 'error' || activity === 'ws error') {
+      text = 'ws error';
+    } else if (connectionRaw === 'disconnected') {
+      text = 'offline';
+    } else if (connectionRaw === 'initializing') {
+      text = 'initializing';
+    } else if (activity && activity !== 'ready' && activity !== 'init') {
+      text = activity;
     }
-
-    if (this.statusText) {
-      return `${compact} | ${this.statusText}`.slice(0, 400);
-    }
-
-    return compact;
+    return `${micGlyph}${connectionGlyph} ${flowGlyph} ${text}`.slice(0, 56);
   }
 
   #composeContentText() {
