@@ -101,6 +101,7 @@ npm run tunnel:quick
 Set matching env values:
 - `VITE_WS_BASE_URL=wss://codex-even-api.example.com/ws`
 - `ALLOWED_ORIGINS=https://codex-even-app.example.com,http://localhost:5173,http://127.0.0.1:5173`
+- Include your public app host in `ALLOWED_ORIGINS` (or set `VITE_ALLOWED_HOSTS`) so Vite dev/preview host checks allow that domain.
 
 By default the script runs tunnel `codex-even`.
 The script resolves the tunnel UUID and uses that for route/run calls (avoids name-resolution fallback to default tunnel config).
