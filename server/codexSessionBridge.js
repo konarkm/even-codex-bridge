@@ -122,6 +122,9 @@ class CodexSessionBridge {
     this.recoverPromise = null;
     this.supportsTurnSteer = true;
     this.itemDrafts = new Map();
+    this.startupLogSuppressUntilMs = 0;
+    this.lastNoPrimaryThreadDropLogMs = 0;
+    this.suppressedNoPrimaryThreadDropCount = 0;
   }
 
   async start(state, callbacks, startPayload = {}) {
@@ -132,6 +135,9 @@ class CodexSessionBridge {
       detail: 'Starting Codex app-server session',
     });
 
+    this.startupLogSuppressUntilMs = Date.now() + 15000;
+    this.lastNoPrimaryThreadDropLogMs = 0;
+    this.suppressedNoPrimaryThreadDropCount = 0;
     this.clientVersion = startPayload?.appVersion || this.clientVersion || '0.1.0';
     this.transportLost = false;
 
@@ -145,6 +151,7 @@ class CodexSessionBridge {
       detail: 'Codex bridge ready',
       sessionId: this.threadId,
     });
+    this.startupLogSuppressUntilMs = 0;
   }
 
   async stop(state, callbacks, options = {}) {
@@ -169,6 +176,9 @@ class CodexSessionBridge {
     this.transportLost = false;
     this.recoverPromise = null;
     this.itemDrafts.clear();
+    this.startupLogSuppressUntilMs = 0;
+    this.lastNoPrimaryThreadDropLogMs = 0;
+    this.suppressedNoPrimaryThreadDropCount = 0;
     state.markStopped();
 
     if (sendStatus) {
@@ -681,15 +691,26 @@ class CodexSessionBridge {
     switch (event.method) {
       case 'thread/started': {
         const threadId = event?.params?.thread?.id;
-        if (threadId) {
-          this.threadId = threadId;
-          state.threadId = threadId;
+        if (!threadId) return;
+
+        if (!this.#isPrimaryThreadEvent(state, threadId, event.method)) {
+          return;
         }
+        this.threadId = threadId;
+        state.threadId = threadId;
         return;
       }
       case 'turn/started': {
+        const eventThreadId = event?.params?.threadId;
+        if (!this.#isPrimaryThreadEvent(state, eventThreadId, event.method)) {
+          return;
+        }
+
         const turnId = event?.params?.turn?.id;
         if (turnId) {
+          if (!this.#isExpectedTurnEvent(state, turnId, event.method)) {
+            return;
+          }
           state.setActiveTurn(turnId);
           callbacks.onStatus({
             phase: 'thinking',
@@ -700,8 +721,16 @@ class CodexSessionBridge {
         return;
       }
       case 'turn/completed': {
+        const eventThreadId = event?.params?.threadId;
+        if (!this.#isPrimaryThreadEvent(state, eventThreadId, event.method)) {
+          return;
+        }
+
         const status = event?.params?.turn?.status || 'unknown';
         const turnId = event?.params?.turn?.id || state.activeTurnId;
+        if (!this.#isExpectedTurnEvent(state, turnId, event.method)) {
+          return;
+        }
         state.clearActiveTurn();
         callbacks.onStatus({
           phase: 'turn_completed',
@@ -727,8 +756,16 @@ class CodexSessionBridge {
         return;
       }
       case 'item/agentMessage/delta': {
+        const eventThreadId = event?.params?.threadId;
+        if (!this.#isPrimaryThreadEvent(state, eventThreadId, event.method)) {
+          return;
+        }
+
         const itemId = event?.params?.itemId;
         const turnId = event?.params?.turnId || state.activeTurnId || 'turn-unknown';
+        if (!this.#isExpectedTurnEvent(state, turnId, event.method)) {
+          return;
+        }
         const delta = String(event?.params?.delta || '');
         if (!itemId || !delta) return;
 
@@ -745,6 +782,11 @@ class CodexSessionBridge {
         return;
       }
       case 'item/started': {
+        const eventThreadId = event?.params?.threadId;
+        if (!this.#isPrimaryThreadEvent(state, eventThreadId, event.method)) {
+          return;
+        }
+
         const item = event?.params?.item;
         if (!item || item.type !== 'contextCompaction') return;
 
@@ -757,6 +799,11 @@ class CodexSessionBridge {
         return;
       }
       case 'item/completed': {
+        const eventThreadId = event?.params?.threadId;
+        if (!this.#isPrimaryThreadEvent(state, eventThreadId, event.method)) {
+          return;
+        }
+
         const item = event?.params?.item;
         if (!item) return;
 
@@ -773,6 +820,9 @@ class CodexSessionBridge {
         if (item.type !== 'agentMessage') return;
 
         const turnId = event?.params?.turnId || state.activeTurnId || 'turn-unknown';
+        if (!this.#isExpectedTurnEvent(state, turnId, event.method)) {
+          return;
+        }
         const itemId = item.id;
 
         const draft = itemId ? this.itemDrafts.get(itemId) : null;
@@ -791,16 +841,26 @@ class CodexSessionBridge {
         return;
       }
       case 'thread/tokenUsage/updated': {
+        const eventThreadId = event?.params?.threadId;
+        if (!this.#isPrimaryThreadEvent(state, eventThreadId, event.method)) {
+          return;
+        }
+
         const usage = event?.params?.tokenUsage;
         if (!usage) return;
 
         callbacks.onMetrics({
-          threadId: this.threadId,
+          threadId: eventThreadId || this.threadId,
           tokenUsage: usage,
         });
         return;
       }
       case 'error': {
+        const eventThreadId = event?.params?.threadId;
+        if (eventThreadId && !this.#isPrimaryThreadEvent(state, eventThreadId, event.method)) {
+          return;
+        }
+
         const message = event?.params?.error?.message || 'Codex app-server emitted error notification';
         callbacks.onError({
           code: 'codex_error',
@@ -814,8 +874,51 @@ class CodexSessionBridge {
     }
   }
 
-  async #handleServerRequest(_state, callbacks, event) {
+  async #handleServerRequest(state, callbacks, event) {
     if (!this.rpc) return;
+
+    const method = String(event?.method || '');
+    const requestThreadId = String(event?.params?.threadId || '').trim();
+    const requestTurnId = String(event?.params?.turnId || '').trim();
+    const methodLabel = method ? `serverRequest:${method}` : 'serverRequest:unknown';
+    const isApprovalMethod = (
+      method === 'item/commandExecution/requestApproval'
+      || method === 'item/fileChange/requestApproval'
+    );
+
+    if (isApprovalMethod && !requestThreadId) {
+      this.logger?.debug?.('server_request_declined_missing_thread_id', {
+        method,
+      });
+      await this.rpc.respond(event.id, {
+        decision: 'decline',
+      });
+      return;
+    }
+
+    if (isApprovalMethod && !this.#isPrimaryThreadEvent(state, requestThreadId, methodLabel)) {
+      this.logger?.debug?.('server_request_declined_thread_mismatch', {
+        method,
+        requestThreadId,
+        primaryThreadId: this.#primaryThreadId(state),
+      });
+      await this.rpc.respond(event.id, {
+        decision: 'decline',
+      });
+      return;
+    }
+
+    if (isApprovalMethod && requestTurnId && !this.#isExpectedTurnEvent(state, requestTurnId, methodLabel)) {
+      this.logger?.debug?.('server_request_declined_turn_mismatch', {
+        method,
+        requestTurnId,
+        activeTurnId: String(state?.activeTurnId || '') || null,
+      });
+      await this.rpc.respond(event.id, {
+        decision: 'decline',
+      });
+      return;
+    }
 
     if (event.method === 'item/commandExecution/requestApproval') {
       await this.rpc.respond(event.id, {
@@ -1280,6 +1383,98 @@ class CodexSessionBridge {
     if (!this.#isSparkLikeModel(model)) return normalizedEffort;
     if (SPARK_SUPPORTED_EFFORTS.has(normalizedEffort)) return normalizedEffort;
     return 'low';
+  }
+
+  #primaryThreadId(state) {
+    const stateThreadId = String(state?.threadId || '').trim();
+    if (stateThreadId) return stateThreadId;
+    const localThreadId = String(this.threadId || '').trim();
+    return localThreadId || null;
+  }
+
+  #isPrimaryThreadEvent(state, eventThreadIdRaw, method) {
+    const eventThreadId = String(eventThreadIdRaw || '').trim();
+    const primaryThreadId = this.#primaryThreadId(state);
+
+    if (!primaryThreadId) {
+      this.#logNoPrimaryThreadDrop(method, eventThreadId);
+      return false;
+    }
+
+    if (!eventThreadId) {
+      this.logger?.debug?.('notification_dropped_missing_thread_id', {
+        method,
+        primaryThreadId,
+      });
+      return false;
+    }
+
+    if (eventThreadId !== primaryThreadId) {
+      this.logger?.debug?.('notification_dropped_thread_mismatch', {
+        method,
+        eventThreadId,
+        primaryThreadId,
+      });
+      return false;
+    }
+
+    return true;
+  }
+
+  #logNoPrimaryThreadDrop(method, eventThreadId) {
+    const now = Date.now();
+    const inStartupWindow = this.startupLogSuppressUntilMs > 0 && now <= this.startupLogSuppressUntilMs;
+
+    if (!inStartupWindow) {
+      this.logger?.debug?.('notification_dropped_no_primary_thread', {
+        method,
+        eventThreadId: eventThreadId || null,
+      });
+      return;
+    }
+
+    const cooldownMs = 5000;
+    const canLogNow = !this.lastNoPrimaryThreadDropLogMs || (now - this.lastNoPrimaryThreadDropLogMs) >= cooldownMs;
+    if (!canLogNow) {
+      this.suppressedNoPrimaryThreadDropCount += 1;
+      return;
+    }
+
+    const suppressedCount = this.suppressedNoPrimaryThreadDropCount;
+    this.suppressedNoPrimaryThreadDropCount = 0;
+    this.lastNoPrimaryThreadDropLogMs = now;
+    this.logger?.debug?.('notification_dropped_no_primary_thread', {
+      method,
+      eventThreadId: eventThreadId || null,
+      startupSuppressedCount: suppressedCount,
+    });
+  }
+
+  #isExpectedTurnEvent(state, eventTurnIdRaw, method) {
+    const activeTurnId = String(state?.activeTurnId || '').trim();
+    if (!activeTurnId) {
+      return true;
+    }
+
+    const eventTurnId = String(eventTurnIdRaw || '').trim();
+    if (!eventTurnId) {
+      this.logger?.debug?.('notification_dropped_missing_turn_id', {
+        method,
+        activeTurnId,
+      });
+      return false;
+    }
+
+    if (eventTurnId !== activeTurnId) {
+      this.logger?.debug?.('notification_dropped_turn_mismatch', {
+        method,
+        eventTurnId,
+        activeTurnId,
+      });
+      return false;
+    }
+
+    return true;
   }
 }
 
