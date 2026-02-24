@@ -8,6 +8,8 @@ const STATUS_CONTAINER_ID = 1;
 const STATUS_CONTAINER_NAME = 'ambient-status';
 const CONTENT_CONTAINER_ID = 2;
 const CONTENT_CONTAINER_NAME = 'ambient-main';
+const LIST_CAPTURE_CONTAINER_ID = 3;
+const LIST_CAPTURE_CONTAINER_NAME = 'ambient-capture';
 const INITIAL_STATUS_TEXT = 'listening | init | starting';
 const INITIAL_CONTENT_TEXT = '';
 const STATUS_CONTAINER_FRAME = {
@@ -30,11 +32,35 @@ const CONTENT_CONTAINER_FRAME = {
   borderRdaius: 2,
   paddingLength: 6,
 };
+const LIST_CAPTURE_CONTAINER_FRAME = {
+  xPosition: 0,
+  yPosition: 282,
+  width: 20,
+  height: 6,
+  borderWidth: 0,
+  borderColor: 0,
+  borderRdaius: 0,
+  paddingLength: 0,
+};
 const STATUS_MAX_CHARS = 56;
 
 function normalizeStatusSegment(value, maxChars) {
   const compact = String(value || '').replace(/\s+/g, ' ').trim();
   return compact.slice(0, maxChars);
+}
+
+function normalizeOsEventType(rawType) {
+  const direct = OsEventTypeList.fromJson(rawType);
+  if (direct != null) return direct;
+
+  // Some firmware builds send eventType as numeric strings (e.g. "0").
+  // The SDK parser handles numeric values, but not numeric-string values.
+  if (typeof rawType === 'string' && /^[0-9]+$/.test(rawType.trim())) {
+    const parsed = Number(rawType.trim());
+    return OsEventTypeList.fromJson(parsed);
+  }
+
+  return undefined;
 }
 
 function normalizeStartResult(raw) {
@@ -44,10 +70,11 @@ function normalizeStartResult(raw) {
 }
 
 export class EvenBridgeController {
-  constructor(logger) {
+  constructor(logger, options = {}) {
     this.logger = logger;
     this.bridge = null;
     this.initialized = false;
+    this.eventCaptureMode = options.eventCaptureMode === 'list' ? 'list' : 'text';
     this.lastStatusText = '';
     this.lastContentText = '';
     this.audioSubscribers = new Set();
@@ -60,6 +87,9 @@ export class EvenBridgeController {
     if (this.initialized) return;
 
     this.bridge = await waitForEvenAppBridge();
+    this.logger?.info?.('Initializing Even bridge containers', {
+      eventCaptureMode: this.eventCaptureMode,
+    });
     const startupContainer = this.#buildTextContainers(INITIAL_STATUS_TEXT, INITIAL_CONTENT_TEXT);
 
     const startupResult = await this.bridge.createStartUpPageContainer(startupContainer);
@@ -257,24 +287,47 @@ export class EvenBridgeController {
   }
 
   #buildTextContainers(statusContent, bodyContent) {
+    const textObject = [
+      {
+        ...STATUS_CONTAINER_FRAME,
+        containerID: STATUS_CONTAINER_ID,
+        containerName: STATUS_CONTAINER_NAME,
+        content: normalizeStatusSegment(statusContent, STATUS_MAX_CHARS),
+        isEventCapture: 0,
+      },
+      {
+        ...CONTENT_CONTAINER_FRAME,
+        containerID: CONTENT_CONTAINER_ID,
+        containerName: CONTENT_CONTAINER_NAME,
+        content: String(bodyContent || '').slice(0, 2000),
+        isEventCapture: this.eventCaptureMode === 'text' ? 1 : 0,
+      },
+    ];
+
+    if (this.eventCaptureMode === 'list') {
+      return {
+        containerTotalNum: 3,
+        textObject,
+        listObject: [
+          {
+            ...LIST_CAPTURE_CONTAINER_FRAME,
+            containerID: LIST_CAPTURE_CONTAINER_ID,
+            containerName: LIST_CAPTURE_CONTAINER_NAME,
+            isEventCapture: 1,
+            itemContainer: {
+              itemCount: 1,
+              itemWidth: 0,
+              isItemSelectBorderEn: 0,
+              itemName: ['capture'],
+            },
+          },
+        ],
+      };
+    }
+
     return {
       containerTotalNum: 2,
-      textObject: [
-        {
-          ...STATUS_CONTAINER_FRAME,
-          containerID: STATUS_CONTAINER_ID,
-          containerName: STATUS_CONTAINER_NAME,
-          content: normalizeStatusSegment(statusContent, STATUS_MAX_CHARS),
-          isEventCapture: 0,
-        },
-        {
-          ...CONTENT_CONTAINER_FRAME,
-          containerID: CONTENT_CONTAINER_ID,
-          containerName: CONTENT_CONTAINER_NAME,
-          content: String(bodyContent || '').slice(0, 2000),
-          isEventCapture: 1,
-        },
-      ],
+      textObject,
     };
   }
 
@@ -305,15 +358,15 @@ export class EvenBridgeController {
       const uiEventCandidates = [
         {
           source: 'sysEvent',
-          eventType: OsEventTypeList.fromJson(event?.sysEvent?.eventType),
+          eventType: normalizeOsEventType(event?.sysEvent?.eventType),
         },
         {
           source: 'textEvent',
-          eventType: OsEventTypeList.fromJson(event?.textEvent?.eventType),
+          eventType: normalizeOsEventType(event?.textEvent?.eventType),
         },
         {
           source: 'listEvent',
-          eventType: OsEventTypeList.fromJson(event?.listEvent?.eventType),
+          eventType: normalizeOsEventType(event?.listEvent?.eventType),
         },
       ].filter((entry) => entry.eventType != null);
 

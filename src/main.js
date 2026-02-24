@@ -16,7 +16,6 @@ import {
   compactStatusLabel,
   nextManualMicToggle,
   shouldAutoResume,
-  toggleFocusMode,
 } from './uxState.mjs';
 import { WsClient } from './wsClient.js';
 
@@ -35,7 +34,6 @@ const els = {
 const DEFAULT_WS_URL = import.meta.env.VITE_WS_BASE_URL || '';
 const DEFAULT_TOKEN = import.meta.env.VITE_CLIENT_SHARED_TOKEN || '';
 const TEXT_UPDATE_THROTTLE_MS = Number(import.meta.env.VITE_TEXT_UPDATE_THROTTLE_MS || 120);
-const CLICK_SUPPRESS_AFTER_DOUBLE_MS = 400;
 const queryParams = new URLSearchParams(window.location.search);
 
 function isTruthyParam(value) {
@@ -44,6 +42,10 @@ function isTruthyParam(value) {
 }
 
 const AUTO_START = isTruthyParam(import.meta.env.VITE_AUTO_START) || isTruthyParam(queryParams.get('autostart'));
+const EVENT_CAPTURE_MODE = (() => {
+  const raw = queryParams.get('capture') || import.meta.env.VITE_EVENT_CAPTURE_MODE || 'text';
+  return String(raw).trim().toLowerCase() === 'list' ? 'list' : 'text';
+})();
 
 function safeGetItem(key, fallback = '') {
   try {
@@ -90,7 +92,7 @@ const logger = {
   debug: (msg, meta) => log('debug', msg, meta),
 };
 
-const evenBridge = new EvenBridgeController(logger);
+const evenBridge = new EvenBridgeController(logger, { eventCaptureMode: EVENT_CAPTURE_MODE });
 const wsClient = new WsClient({
   baseUrl: storedWsUrl,
   token: storedToken,
@@ -109,7 +111,6 @@ let pingTimer = null;
 let started = false;
 let cachedDeviceInfo = null;
 let micTransitionQueue = Promise.resolve();
-let lastDoubleClickEventAt = 0;
 
 let micState = MIC_LISTENING;
 let muteReason = MUTE_REASON_NONE;
@@ -203,7 +204,7 @@ async function applyMicStateTransition(nextMicState, nextMuteReason, source) {
       compactStatus: compactStatusLabel({ micState, connectionState }),
     });
 
-    if (source === 'ring_click') {
+    if (source === 'ring_click' || source === 'ring_double_click') {
       const ringStatus = micState === MIC_MUTED ? 'Mic muted' : 'Mic listening';
       setStatus(ringStatus);
       renderer.setStatus(ringStatus);
@@ -213,6 +214,8 @@ async function applyMicStateTransition(nextMicState, nextMuteReason, source) {
   } catch (error) {
     const message = error?.message || String(error);
     if (nextMicState === MIC_MUTED) {
+      // Fallback to app-level (pipeline) mute: stop forwarding frames even if SDK
+      // hardware mic close fails on this firmware/build.
       micState = nextMicState;
       muteReason = nextMuteReason;
       renderer.setMicState(micState);
@@ -313,7 +316,6 @@ function markFlowIdle(source) {
 async function handleUiEvent(uiEvent) {
   const eventType = Number(uiEvent?.eventType);
   if (!Number.isFinite(eventType)) return;
-  const now = Date.now();
   const rawEvent = uiEvent?.rawEvent || {};
   logger.debug('Received ring/ui event', {
     eventType,
@@ -324,22 +326,13 @@ async function handleUiEvent(uiEvent) {
   });
 
   if (eventType === OS_EVENT_DOUBLE_CLICK) {
-    lastDoubleClickEventAt = now;
-    focusMode = toggleFocusMode(focusMode);
-    renderer.setFocusMode(focusMode);
-    logger.info('Toggled focus mode', { focusMode });
+    logger.info('Applying double-click mic toggle');
+    await toggleMicManually('ring_double_click');
     return;
   }
 
   if (eventType === OS_EVENT_CLICK) {
-    if (now - lastDoubleClickEventAt < CLICK_SUPPRESS_AFTER_DOUBLE_MS) {
-      logger.debug('Suppressed click because it is adjacent to a double-click', {
-        sinceMs: now - lastDoubleClickEventAt,
-      });
-      return;
-    }
-    logger.info('Applying single-click mic toggle');
-    await toggleMicManually('ring_click');
+    logger.debug('Ignoring single-click while testing double-click mic toggle');
     return;
   }
 
@@ -500,6 +493,7 @@ async function startAssistant() {
     wsUrl: wsClient.baseUrl,
     hasToken: Boolean(wsClient.token),
     textUpdateThrottleMs: TEXT_UPDATE_THROTTLE_MS,
+    eventCaptureMode: EVENT_CAPTURE_MODE,
   });
   renderer.reset();
   audioForwarder.reset();
@@ -557,7 +551,6 @@ async function startAssistant() {
 
   started = true;
   micTransitionQueue = Promise.resolve();
-  lastDoubleClickEventAt = 0;
   refreshMicToggleButton();
   evaluateAutoMutePolicy('startup').catch(() => {
     // No-op.
@@ -574,7 +567,6 @@ async function stopAssistant() {
   if (!started) return;
 
   started = false;
-  lastDoubleClickEventAt = 0;
   markFlowIdle('stop');
 
   sendSessionStop('user_requested_stop', 'stopAssistant');
@@ -627,7 +619,6 @@ function teardownBestEffort() {
   });
 
   started = false;
-  lastDoubleClickEventAt = 0;
   markFlowIdle('teardown');
 
   sendSessionStop('window_unload', 'beforeunload');
