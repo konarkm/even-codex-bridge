@@ -524,6 +524,13 @@ async function startAssistant() {
   renderer.setStatus('Initializing Even bridge...');
 
   await evenBridge.init();
+  try {
+    await evenBridge.reapplyLayout();
+  } catch (error) {
+    logger.warn('Layout reapply failed', {
+      message: error?.message || String(error),
+    });
+  }
   cachedDeviceInfo = await evenBridge.getDeviceInfo();
 
   audioUnsubscribe = evenBridge.subscribeAudio((audioFrame) => {

@@ -16,17 +16,17 @@ const STATUS_CONTAINER_FRAME = {
   xPosition: 0,
   yPosition: 0,
   width: 576,
-  height: 46,
+  height: 36,
   borderWidth: 0,
   borderColor: 7,
   borderRdaius: 0,
-  paddingLength: 6,
+  paddingLength: 0,
 };
 const CONTENT_CONTAINER_FRAME = {
   xPosition: 0,
-  yPosition: 48,
+  yPosition: 38,
   width: 576,
-  height: 240,
+  height: 250,
   borderWidth: 1,
   borderColor: 7,
   borderRdaius: 2,
@@ -284,6 +284,19 @@ export class EvenBridgeController {
   async updateText(text) {
     // Backward-compatible helper for older caller paths.
     await this.updateContent(text);
+  }
+
+  async reapplyLayout() {
+    if (!this.bridge || !this.initialized) return false;
+
+    const status = this.lastStatusText || INITIAL_STATUS_TEXT;
+    const content = this.lastContentText || INITIAL_CONTENT_TEXT;
+    const rebuilt = await this.bridge.rebuildPageContainer(this.#buildTextContainers(status, content));
+    if (!rebuilt) {
+      this.logger?.warn?.('rebuildPageContainer failed while reapplying layout');
+      return false;
+    }
+    return true;
   }
 
   #buildTextContainers(statusContent, bodyContent) {

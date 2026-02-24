@@ -279,7 +279,7 @@ export class UiRenderer {
     } else if (activity && activity !== 'ready' && activity !== 'init') {
       text = activity;
     }
-    return `${micGlyph}${connectionGlyph} ${flowGlyph} ${text}`.slice(0, 56);
+    return `${connectionGlyph}${micGlyph} ${flowGlyph} ${text}`.slice(0, 56);
   }
 
   #composeContentText() {
