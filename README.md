@@ -37,11 +37,15 @@ This repo is configured for YOLO mode:
 3. Optional model toggle config:
 - `CODEX_MAIN_MODEL` (default: `gpt-5.3-codex`; legacy fallback: `CODEX_MODEL`)
 - `CODEX_FAST_MODEL` (default: `gpt-5.3-codex-spark`)
-4. Optional thread persistence (recommended):
+4. Optional session guidance config:
+- `CODEX_SESSION_GUIDANCE` sets thread-level `developerInstructions` for both `thread/start` and `thread/resume`.
+- If unset, a smart-glasses-safe default is applied.
+- Set `CODEX_SESSION_GUIDANCE=` (empty) to disable this guidance.
+5. Optional thread persistence (recommended):
 - `ENABLE_DEFAULT_THREAD_RESUME=1`
 - `ENABLE_PERSIST_THREAD_STATE=1`
 - `THREAD_STATE_FILE=.runtime/thread-state.json`
-5. STT configuration:
+6. STT configuration:
 - `STT_PROVIDER=elevenlabs`
 - `STT_API_KEY=<your key>`
 - `STT_MODEL_ID=scribe_v2_realtime`
@@ -192,6 +196,7 @@ Stop/start behavior:
 - The web app caches the latest `sessionId` and sends it as `resumeThreadId` on next `session.start`.
 - If `ENABLE_PERSIST_THREAD_STATE=1`, backend also persists the latest thread id to `THREAD_STATE_FILE`.
 - Backend attempts `thread/resume` first (client `resumeThreadId`, else persisted server thread id), then falls back to `thread/start` if resume is unavailable.
+- `CODEX_SESSION_GUIDANCE` is applied as thread `developerInstructions` on both `thread/start` and `thread/resume`.
 
 ## UI behavior
 - `text.submit` (manual prompt box) remains a permanent dev/QA path.

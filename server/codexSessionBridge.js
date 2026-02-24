@@ -79,6 +79,7 @@ class CodexSessionBridge {
     this.codexCwd = options.codexCwd || process.cwd();
     this.mainModel = options.mainModel || options.model || 'gpt-5.3-codex';
     this.fastModel = options.fastModel || 'gpt-5.3-codex-spark';
+    this.sessionGuidance = String(options.sessionGuidance || '').trim();
     const persistedModelState = options.persistedModelState || {};
     this.model = normalizeModel(persistedModelState.activeModel) || this.mainModel;
     this.effortByModel = normalizeEffortByModel(persistedModelState.effortByModel);
@@ -476,6 +477,7 @@ class CodexSessionBridge {
       approvalPolicy: this.approvalPolicy,
       sandbox: 'danger-full-access',
       experimentalRawEvents: false,
+      ...this.#threadInstructionOverrides(),
     });
 
     let threadRaw;
@@ -639,6 +641,7 @@ class CodexSessionBridge {
     try {
       const resumeRaw = await this.rpc.request('thread/resume', {
         threadId,
+        ...this.#threadInstructionOverrides(),
       });
 
       const resumedThreadId = resumeRaw?.thread?.id;
@@ -1222,6 +1225,16 @@ class CodexSessionBridge {
       message.includes('thread not found') ||
       message.includes('rpc request timed out: turn/start')
     );
+  }
+
+  #threadInstructionOverrides() {
+    if (!this.sessionGuidance) {
+      return {};
+    }
+
+    return {
+      developerInstructions: this.sessionGuidance,
+    };
   }
 }
 

@@ -22,6 +22,19 @@ const CODEX_CWD = process.env.CODEX_CWD || process.cwd();
 const CODEX_MODEL = process.env.CODEX_MODEL || 'gpt-5.3-codex';
 const CODEX_MAIN_MODEL = process.env.CODEX_MAIN_MODEL || CODEX_MODEL;
 const CODEX_FAST_MODEL = process.env.CODEX_FAST_MODEL || 'gpt-5.3-codex-spark';
+const DEFAULT_CODEX_SESSION_GUIDANCE = [
+  'You are assisting through smart glasses.',
+  'Keep responses concise and easy to skim.',
+  'Speech-to-text may contain background-noise mistakes; if intent is ambiguous, ask a brief clarification question before proceeding.',
+  'Before high-impact or irreversible actions, explicitly confirm intent.',
+  'Never take destructive actions without explicit confirmation.',
+].join(' ');
+const CODEX_SESSION_GUIDANCE = (() => {
+  if (process.env.CODEX_SESSION_GUIDANCE === undefined) {
+    return DEFAULT_CODEX_SESSION_GUIDANCE;
+  }
+  return String(process.env.CODEX_SESSION_GUIDANCE || '').trim();
+})();
 const STT_PROVIDER = process.env.STT_PROVIDER || 'none';
 const STT_API_KEY = process.env.STT_API_KEY || '';
 const STT_LANGUAGE = process.env.STT_LANGUAGE || 'en';
@@ -237,6 +250,7 @@ wss.on('connection', (ws, req) => {
     codexCwd: CODEX_CWD,
     mainModel: CODEX_MAIN_MODEL,
     fastModel: CODEX_FAST_MODEL,
+    sessionGuidance: CODEX_SESSION_GUIDANCE,
     approvalPolicy: 'never',
     sandboxPolicy: { type: 'dangerFullAccess' },
     sttProvider: STT_PROVIDER,
@@ -513,6 +527,7 @@ server.listen(PORT, '0.0.0.0', () => {
     port: PORT,
     model: CODEX_MAIN_MODEL,
     fastModel: CODEX_FAST_MODEL,
+    guidanceEnabled: Boolean(CODEX_SESSION_GUIDANCE),
     sttProvider: STT_PROVIDER,
     sttModelId: STT_MODEL_ID,
     sttVadTuning: {
