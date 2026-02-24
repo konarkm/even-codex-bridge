@@ -67,7 +67,15 @@ For simulator/automation loops, you can boot directly into the running assistant
 Example:
 `https://codex-even-app.example.com/?autostart=1`
 
-## Cloudflared tunnel
+## Cloudflared tunnel (optional, for outside-network access)
+Use this only when you want remote/public access to your local dev server.
+Local development on the same machine/LAN does not require Cloudflare.
+
+> [!CAUTION]
+> Exposing local services to the internet increases risk.
+> Use a strong `CLIENT_SHARED_TOKEN`, keep `ALLOWED_ORIGINS` tight, and prefer Cloudflare Access/WAF controls for public deployments.
+> Never commit secrets (`.env`, tunnel tokens, credentials files, runtime logs).
+
 One-time setup for a named tunnel + DNS routes:
 ```bash
 cloudflared tunnel create codex-even
@@ -96,6 +104,10 @@ Set matching env values:
 
 By default the script runs tunnel `codex-even`.
 The script resolves the tunnel UUID and uses that for route/run calls (avoids name-resolution fallback to default tunnel config).
+Auth for `npm run tunnel` can come from any one of:
+- `~/.cloudflared/<tunnel-uuid>.json` credentials file
+- `TUNNEL_TOKEN` environment variable
+- runtime token generation via `cloudflared tunnel token <tunnel-name>` (requires authenticated cloudflared CLI)
 
 ## Protocol
 Client -> server:

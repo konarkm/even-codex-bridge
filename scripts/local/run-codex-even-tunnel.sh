@@ -7,6 +7,9 @@ API_HOST="${API_HOST:-codex-even-api.example.com}"
 APP_SERVICE="${APP_SERVICE:-http://127.0.0.1:5173}"
 API_SERVICE="${API_SERVICE:-http://127.0.0.1:${PORT}}"
 PROVISION_DNS=0
+TMP_CONFIG=""
+TOKEN_FILE=""
+TOKEN_ERR_FILE=""
 
 for arg in "$@"; do
   if [[ "${arg}" == "--provision-dns" ]]; then
@@ -36,10 +39,32 @@ if [[ -z "${TUNNEL_ID}" ]]; then
   exit 1
 fi
 
+AUTH_MODE="credentials-file"
 CREDENTIALS_FILE="${HOME}/.cloudflared/${TUNNEL_ID}.json"
 if [[ ! -f "${CREDENTIALS_FILE}" ]]; then
-  echo "Missing credentials file at ${CREDENTIALS_FILE}"
-  exit 1
+  AUTH_MODE="token-file"
+  TOKEN_FILE="$(mktemp -t codex-even-token.XXXXXX)"
+  chmod 600 "${TOKEN_FILE}"
+
+  if [[ -n "${TUNNEL_TOKEN:-}" ]]; then
+    printf '%s\n' "${TUNNEL_TOKEN}" > "${TOKEN_FILE}"
+  else
+    TOKEN_ERR_FILE="$(mktemp -t codex-even-token-err.XXXXXX)"
+    if ! cloudflared tunnel token "${TUNNEL_NAME}" > "${TOKEN_FILE}" 2>"${TOKEN_ERR_FILE}"; then
+      echo "Missing credentials file at ${CREDENTIALS_FILE}"
+      echo "Also failed to obtain a runtime token for tunnel '${TUNNEL_NAME}'."
+      echo "Fix one of the following:"
+      echo "  1) Authenticate cloudflared and retry"
+      echo "  2) Export TUNNEL_TOKEN"
+      echo "  3) Place ${CREDENTIALS_FILE}"
+      if [[ -s "${TOKEN_ERR_FILE}" ]]; then
+        echo
+        echo "cloudflared token error:"
+        cat "${TOKEN_ERR_FILE}"
+      fi
+      exit 1
+    fi
+  fi
 fi
 
 if [[ "${PROVISION_DNS}" -eq 1 ]]; then
@@ -48,15 +73,26 @@ if [[ "${PROVISION_DNS}" -eq 1 ]]; then
   cloudflared tunnel route dns "${TUNNEL_ID}" "${API_HOST}"
 fi
 
-TMP_CONFIG="$(mktemp -t codex-even-tunnel.XXXXXX.yml)"
 cleanup() {
-  rm -f "${TMP_CONFIG}"
+  if [[ -n "${TMP_CONFIG}" ]]; then
+    rm -f "${TMP_CONFIG}"
+  fi
+  if [[ -n "${TOKEN_FILE}" ]]; then
+    rm -f "${TOKEN_FILE}"
+  fi
+  if [[ -n "${TOKEN_ERR_FILE}" ]]; then
+    rm -f "${TOKEN_ERR_FILE}"
+  fi
 }
 trap cleanup EXIT
+TMP_CONFIG="$(mktemp -t codex-even-tunnel.XXXXXX.yml)"
 
-cat > "${TMP_CONFIG}" <<EOF
-tunnel: ${TUNNEL_ID}
-credentials-file: ${CREDENTIALS_FILE}
+{
+  echo "tunnel: ${TUNNEL_ID}"
+  if [[ "${AUTH_MODE}" == "credentials-file" ]]; then
+    echo "credentials-file: ${CREDENTIALS_FILE}"
+  fi
+  cat <<EOF
 ingress:
   - hostname: ${APP_HOST}
     service: ${APP_SERVICE}
@@ -64,8 +100,12 @@ ingress:
     service: ${API_SERVICE}
   - service: http_status:404
 EOF
+} > "${TMP_CONFIG}"
 
 echo "Starting tunnel '${TUNNEL_NAME}' (${TUNNEL_ID})"
 echo "  ${APP_HOST} -> ${APP_SERVICE}"
 echo "  ${API_HOST} -> ${API_SERVICE}"
-exec cloudflared --config "${TMP_CONFIG}" tunnel run "${TUNNEL_ID}"
+if [[ "${AUTH_MODE}" == "credentials-file" ]]; then
+  exec cloudflared --config "${TMP_CONFIG}" tunnel run "${TUNNEL_ID}"
+fi
+exec cloudflared --config "${TMP_CONFIG}" tunnel run --token-file "${TOKEN_FILE}" "${TUNNEL_ID}"
