@@ -11,6 +11,15 @@ class ClientSessionState {
       sttFinals: 0,
       turnsStarted: 0,
       turnsSteered: 0,
+      sessionStartRequests: 0,
+      sessionStartInFlightRejected: 0,
+      codexTransportLosses: 0,
+      codexRecoveryAttempts: 0,
+      codexRecoverySuccesses: 0,
+      codexRecoveryFailures: 0,
+      codexLastRecoveryLatencyMs: null,
+      threadResumeSuccesses: 0,
+      threadResumeFailures: 0,
       lastError: null,
     };
   }
@@ -41,6 +50,15 @@ class ClientSessionState {
       sttFinals: 0,
       turnsStarted: 0,
       turnsSteered: 0,
+      sessionStartRequests: 0,
+      sessionStartInFlightRejected: 0,
+      codexTransportLosses: 0,
+      codexRecoveryAttempts: 0,
+      codexRecoverySuccesses: 0,
+      codexRecoveryFailures: 0,
+      codexLastRecoveryLatencyMs: null,
+      threadResumeSuccesses: 0,
+      threadResumeFailures: 0,
       lastError: null,
     };
   }

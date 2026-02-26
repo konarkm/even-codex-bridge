@@ -22,6 +22,7 @@ function mergeDeltaText(previous, incoming) {
 
 const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 const SPARK_SUPPORTED_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
+const DROP_SUMMARY_INTERVAL_MS = 60000;
 
 function normalizeReasoningEffort(value) {
   const normalized = String(value || '').trim().toLowerCase();
@@ -125,10 +126,24 @@ class CodexSessionBridge {
     this.startupLogSuppressUntilMs = 0;
     this.lastNoPrimaryThreadDropLogMs = 0;
     this.suppressedNoPrimaryThreadDropCount = 0;
+    this.isStopping = false;
+    this.transportRecoveryScheduled = false;
+    this.dropMetricWindowStartedAtMs = Date.now();
+    this.dropMetricLastSummaryAtMs = Date.now();
+    this.dropMetricCounts = this.#emptyDropMetrics();
+    this.currentClientId = null;
+    this.lastKnownThreadId = null;
+    this.proactiveRecoveryRetryCount = 0;
+    this.proactiveRecoveryTimer = null;
   }
 
   async start(state, callbacks, startPayload = {}) {
+    this.isStopping = false;
+    this.transportRecoveryScheduled = false;
     await this.stop(state, callbacks, { sendStatus: false });
+    this.#resetDropMetrics();
+    this.currentClientId = state.clientId || null;
+    this.proactiveRecoveryRetryCount = 0;
 
     callbacks.onStatus({
       phase: 'starting',
@@ -151,41 +166,58 @@ class CodexSessionBridge {
       detail: 'Codex bridge ready',
       sessionId: this.threadId,
     });
+    this.isStopping = false;
     this.startupLogSuppressUntilMs = 0;
   }
 
   async stop(state, callbacks, options = {}) {
     const { sendStatus = true } = options;
+    this.isStopping = true;
+    try {
+      this.#emitDropMetricSummary('session_stop', true);
 
-    if (this.stt) {
-      this.stt.stop();
-      this.stt = null;
-    }
-
-    if (this.rpc) {
-      try {
-        await this.rpc.stop();
-      } catch {
-        // Ignore cleanup errors.
+      if (this.proactiveRecoveryTimer) {
+        clearTimeout(this.proactiveRecoveryTimer);
+        this.proactiveRecoveryTimer = null;
       }
-      this.rpc.removeAllListeners();
-      this.rpc = null;
-    }
 
-    this.threadId = null;
-    this.transportLost = false;
-    this.recoverPromise = null;
-    this.itemDrafts.clear();
-    this.startupLogSuppressUntilMs = 0;
-    this.lastNoPrimaryThreadDropLogMs = 0;
-    this.suppressedNoPrimaryThreadDropCount = 0;
-    state.markStopped();
+      if (this.stt) {
+        this.stt.stop();
+        this.stt = null;
+      }
 
-    if (sendStatus) {
-      callbacks.onStatus({
-        phase: 'stopped',
-        detail: 'Session stopped',
-      });
+      if (this.rpc) {
+        try {
+          await this.rpc.stop();
+        } catch {
+          // Ignore cleanup errors.
+        }
+        this.rpc.removeAllListeners();
+        this.rpc = null;
+      }
+
+      this.threadId = null;
+      this.transportLost = false;
+      this.recoverPromise = null;
+      this.itemDrafts.clear();
+      this.startupLogSuppressUntilMs = 0;
+      this.lastNoPrimaryThreadDropLogMs = 0;
+      this.suppressedNoPrimaryThreadDropCount = 0;
+      this.transportRecoveryScheduled = false;
+      this.proactiveRecoveryRetryCount = 0;
+      this.#resetDropMetrics();
+      this.currentClientId = null;
+      this.lastKnownThreadId = null;
+      state.markStopped();
+
+      if (sendStatus) {
+        callbacks.onStatus({
+          phase: 'stopped',
+          detail: 'Session stopped',
+        });
+      }
+    } finally {
+      this.isStopping = false;
     }
   }
 
@@ -498,6 +530,8 @@ class CodexSessionBridge {
       if (!this.#isThreadStartTimeout(error)) {
         throw error;
       }
+      const recoveryStartedAtMs = Date.now();
+      state.metrics.codexRecoveryAttempts += 1;
 
       callbacks.onStatus({
         phase: 'recovering',
@@ -505,11 +539,19 @@ class CodexSessionBridge {
         sessionId: this.threadId,
       });
 
-      await this.#restartRpcOnly(state, callbacks);
-      if (!this.rpc) {
-        throw new Error('Codex RPC restart failed');
+      try {
+        await this.#restartRpcOnly(state, callbacks);
+        if (!this.rpc) {
+          throw new Error('Codex RPC restart failed');
+        }
+        threadRaw = await this.rpc.request('thread/start', makeThreadStartParams());
+        state.metrics.codexRecoverySuccesses += 1;
+        state.metrics.codexLastRecoveryLatencyMs = Math.max(0, Date.now() - recoveryStartedAtMs);
+      } catch (restartError) {
+        state.metrics.codexRecoveryFailures += 1;
+        state.metrics.codexLastRecoveryLatencyMs = Math.max(0, Date.now() - recoveryStartedAtMs);
+        throw restartError;
       }
-      threadRaw = await this.rpc.request('thread/start', makeThreadStartParams());
     }
 
     const threadId = threadRaw?.thread?.id;
@@ -518,6 +560,7 @@ class CodexSessionBridge {
     }
 
     this.threadId = threadId;
+    this.lastKnownThreadId = threadId;
     this.transportLost = false;
     state.markRunning(threadId);
     state.clearActiveTurn();
@@ -567,16 +610,27 @@ class CodexSessionBridge {
 
   #handleRpcTransportLoss(state, callbacks, rpc, message) {
     if (this.rpc !== rpc) return;
+    if (this.isStopping) return;
+    if (this.transportLost) return;
 
+    const wasRunning = Boolean(state.running);
     this.transportLost = true;
+    this.proactiveRecoveryRetryCount = 0;
     this.threadId = null;
     this.itemDrafts.clear();
+    const knownThreadId = String(state.threadId || this.lastKnownThreadId || '').trim();
+    if (knownThreadId) {
+      this.lastKnownThreadId = knownThreadId;
+    }
     state.threadId = null;
     state.clearActiveTurn();
+    state.metrics.codexTransportLosses += 1;
 
     callbacks.onStatus({
       phase: 'codex_disconnected',
-      detail: 'Codex app-server disconnected; attempting recovery on next input',
+      detail: wasRunning
+        ? 'Codex app-server disconnected; attempting immediate recovery'
+        : 'Codex app-server disconnected during startup',
       sessionId: null,
     });
 
@@ -584,6 +638,58 @@ class CodexSessionBridge {
       code: 'codex_transport_closed',
       message: message || 'Codex app-server transport closed',
       recoverable: true,
+    });
+
+    if (wasRunning) {
+      this.#scheduleProactiveRecovery(state, callbacks, 'transport_loss', 0);
+    }
+  }
+
+  #scheduleProactiveRecovery(state, callbacks, reason, attempt = 0) {
+    if (this.isStopping || !state.running || !this.transportLost) {
+      return;
+    }
+    if (this.transportRecoveryScheduled || this.recoverPromise) {
+      return;
+    }
+
+    this.transportRecoveryScheduled = true;
+    queueMicrotask(() => {
+      (async () => {
+        try {
+          if (this.isStopping || !state.running || !this.transportLost) {
+            return;
+          }
+          const recovered = await this.#recoverRpcAndThread(state, callbacks, reason);
+          if (recovered) {
+            this.proactiveRecoveryRetryCount = 0;
+            return;
+          }
+
+          if (attempt >= 2 || this.isStopping || !state.running || !this.transportLost) {
+            return;
+          }
+
+          const backoffMs = Math.min(5000, (500 * (2 ** attempt)) + Math.floor(Math.random() * 250));
+          this.proactiveRecoveryRetryCount = attempt + 1;
+          callbacks.onStatus({
+            phase: 'recovering',
+            detail: `Recovery retry ${attempt + 1} scheduled in ${Math.ceil(backoffMs / 1000)}s`,
+            sessionId: null,
+          });
+          if (this.proactiveRecoveryTimer) {
+            clearTimeout(this.proactiveRecoveryTimer);
+          }
+          this.proactiveRecoveryTimer = setTimeout(() => {
+            this.proactiveRecoveryTimer = null;
+            this.#scheduleProactiveRecovery(state, callbacks, reason, attempt + 1);
+          }, backoffMs);
+        } finally {
+          this.transportRecoveryScheduled = false;
+        }
+      })().catch(() => {
+        // Recovery failures are emitted by #recoverRpcAndThread.
+      });
     });
   }
 
@@ -605,11 +711,17 @@ class CodexSessionBridge {
   }
 
   async #recoverRpcAndThread(state, callbacks, reason) {
+    if (this.isStopping || !state.running) {
+      return false;
+    }
+
     if (this.recoverPromise) {
       return this.recoverPromise;
     }
 
     this.recoverPromise = (async () => {
+      const startedAtMs = Date.now();
+      state.metrics.codexRecoveryAttempts += 1;
       callbacks.onStatus({
         phase: 'recovering',
         detail: `Recovering Codex session (${reason})`,
@@ -624,8 +736,12 @@ class CodexSessionBridge {
           detail: 'Codex session recovered',
           sessionId: this.threadId,
         });
+        state.metrics.codexRecoverySuccesses += 1;
+        state.metrics.codexLastRecoveryLatencyMs = Math.max(0, Date.now() - startedAtMs);
         return true;
       } catch (error) {
+        state.metrics.codexRecoveryFailures += 1;
+        state.metrics.codexLastRecoveryLatencyMs = Math.max(0, Date.now() - startedAtMs);
         callbacks.onError({
           code: 'codex_recovery_failed',
           message: error?.message || String(error),
@@ -661,6 +777,7 @@ class CodexSessionBridge {
       }
 
       this.threadId = resumedThreadId;
+      this.lastKnownThreadId = resumedThreadId;
       this.transportLost = false;
       state.markRunning(resumedThreadId);
       state.clearActiveTurn();
@@ -670,8 +787,10 @@ class CodexSessionBridge {
         detail: successDetail,
         sessionId: resumedThreadId,
       });
+      state.metrics.threadResumeSuccesses += 1;
       return true;
     } catch (error) {
+      state.metrics.threadResumeFailures += 1;
       this.logger.warn('thread_resume_failed', {
         threadId,
         message: error?.message || String(error),
@@ -697,6 +816,7 @@ class CodexSessionBridge {
           return;
         }
         this.threadId = threadId;
+        this.lastKnownThreadId = threadId;
         state.threadId = threadId;
         return;
       }
@@ -1296,6 +1416,11 @@ class CodexSessionBridge {
       this.#emitCommandText(callbacks, `Compaction requested for thread ${this.threadId}`);
     } catch (error) {
       const message = error?.message || String(error);
+      callbacks.onStatus({
+        phase: 'compaction_failed',
+        detail: message,
+        sessionId: this.threadId,
+      });
       callbacks.onError({
         code: 'thread_compact_failed',
         message,
@@ -1385,6 +1510,62 @@ class CodexSessionBridge {
     return 'low';
   }
 
+  #emptyDropMetrics() {
+    return {
+      dropNoPrimaryThread: 0,
+      dropMissingThreadId: 0,
+      dropThreadMismatch: 0,
+      dropMissingTurnId: 0,
+      dropTurnMismatch: 0,
+    };
+  }
+
+  #resetDropMetrics() {
+    this.dropMetricWindowStartedAtMs = Date.now();
+    this.dropMetricLastSummaryAtMs = Date.now();
+    this.dropMetricCounts = this.#emptyDropMetrics();
+  }
+
+  #recordDropMetric(metricKey) {
+    if (!this.dropMetricCounts[metricKey] && this.dropMetricCounts[metricKey] !== 0) {
+      return;
+    }
+    this.dropMetricCounts[metricKey] += 1;
+    this.#maybeEmitDropMetricSummary();
+  }
+
+  #maybeEmitDropMetricSummary() {
+    const now = Date.now();
+    if ((now - this.dropMetricLastSummaryAtMs) < DROP_SUMMARY_INTERVAL_MS) {
+      return;
+    }
+    this.#emitDropMetricSummary('interval', false);
+  }
+
+  #emitDropMetricSummary(reason, force) {
+    const now = Date.now();
+    const counts = this.dropMetricCounts;
+    const total = Object.values(counts).reduce((sum, value) => sum + Number(value || 0), 0);
+    if (total <= 0) {
+      this.dropMetricLastSummaryAtMs = now;
+      return;
+    }
+
+    this.logger?.info?.('non_primary_event_drop_summary', {
+      reason: reason || 'interval',
+      force: Boolean(force),
+      clientId: this.currentClientId || null,
+      threadId: this.threadId || this.lastKnownThreadId || null,
+      windowMs: now - this.dropMetricWindowStartedAtMs,
+      totalDrops: total,
+      ...counts,
+    });
+
+    this.dropMetricWindowStartedAtMs = now;
+    this.dropMetricLastSummaryAtMs = now;
+    this.dropMetricCounts = this.#emptyDropMetrics();
+  }
+
   #primaryThreadId(state) {
     const stateThreadId = String(state?.threadId || '').trim();
     if (stateThreadId) return stateThreadId;
@@ -1402,6 +1583,7 @@ class CodexSessionBridge {
     }
 
     if (!eventThreadId) {
+      this.#recordDropMetric('dropMissingThreadId');
       this.logger?.debug?.('notification_dropped_missing_thread_id', {
         method,
         primaryThreadId,
@@ -1410,6 +1592,7 @@ class CodexSessionBridge {
     }
 
     if (eventThreadId !== primaryThreadId) {
+      this.#recordDropMetric('dropThreadMismatch');
       this.logger?.debug?.('notification_dropped_thread_mismatch', {
         method,
         eventThreadId,
@@ -1422,6 +1605,7 @@ class CodexSessionBridge {
   }
 
   #logNoPrimaryThreadDrop(method, eventThreadId) {
+    this.#recordDropMetric('dropNoPrimaryThread');
     const now = Date.now();
     const inStartupWindow = this.startupLogSuppressUntilMs > 0 && now <= this.startupLogSuppressUntilMs;
 
@@ -1458,6 +1642,7 @@ class CodexSessionBridge {
 
     const eventTurnId = String(eventTurnIdRaw || '').trim();
     if (!eventTurnId) {
+      this.#recordDropMetric('dropMissingTurnId');
       this.logger?.debug?.('notification_dropped_missing_turn_id', {
         method,
         activeTurnId,
@@ -1466,6 +1651,7 @@ class CodexSessionBridge {
     }
 
     if (eventTurnId !== activeTurnId) {
+      this.#recordDropMetric('dropTurnMismatch');
       this.logger?.debug?.('notification_dropped_turn_mismatch', {
         method,
         eventTurnId,

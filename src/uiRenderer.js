@@ -200,10 +200,11 @@ export class UiRenderer {
     this.#scheduleRender();
   }
 
-  async flushNow() {
+  async flushNow(options = {}) {
+    const force = Boolean(options?.force);
     const status = this.#composeStatusLine();
 
-    await this.evenBridge.updateStatus(status);
+    await this.evenBridge.updateStatus(status, { force });
     const attempts = this.#buildContentBudgetAttempts();
     let contentText = '';
     let appliedBudget = null;
@@ -212,7 +213,7 @@ export class UiRenderer {
       const candidate = this.#composeContentTextForBudget(budget);
       contentText = candidate;
       // eslint-disable-next-line no-await-in-loop
-      const ok = await this.evenBridge.updateContent(candidate);
+      const ok = await this.evenBridge.updateContent(candidate, { force });
       if (ok) {
         appliedBudget = budget;
         break;

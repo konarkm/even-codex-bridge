@@ -279,8 +279,10 @@ wss.on('connection', (ws, req) => {
     ip: req.socket.remoteAddress || null,
   });
 
+  let closed = false;
+
   function send(type, payload) {
-    if (ws.readyState !== ws.OPEN) return;
+    if (closed || ws.readyState !== ws.OPEN) return;
 
     try {
       ws.send(makeOutboundMessage(type, payload));
@@ -336,9 +338,9 @@ wss.on('connection', (ws, req) => {
     detail: 'WebSocket authenticated',
   });
 
-  let closed = false;
   let cleanupPromise = null;
   let messageQueue = Promise.resolve();
+  let sessionStartInFlight = false;
 
   async function cleanupConnection(sendStatus = false) {
     if (cleanupPromise) {
@@ -379,6 +381,18 @@ wss.on('connection', (ws, req) => {
 
   async function handleClientMessage(msg) {
     if (msg.type === 'session.start') {
+      state.metrics.sessionStartRequests += 1;
+
+      if (sessionStartInFlight) {
+        state.metrics.sessionStartInFlightRejected += 1;
+        send('status', {
+          phase: 'starting',
+          detail: 'Session start already in progress',
+          sessionId: state.threadId,
+        });
+        return;
+      }
+
       if (state.running) {
         send('status', {
           phase: 'running',
@@ -394,10 +408,15 @@ wss.on('connection', (ws, req) => {
         ? (clientResumeThreadId || persistedResumeThreadId || undefined)
         : undefined;
 
-      await bridge.start(state, callbacks, {
-        ...msg.payload,
-        resumeThreadId,
-      });
+      sessionStartInFlight = true;
+      try {
+        await bridge.start(state, callbacks, {
+          ...msg.payload,
+          resumeThreadId,
+        });
+      } finally {
+        sessionStartInFlight = false;
+      }
       return;
     }
 
@@ -431,6 +450,14 @@ wss.on('connection', (ws, req) => {
 
     if (msg.type === 'session.stop') {
       await bridge.stop(state, callbacks, { sendStatus: true });
+      send('metrics', {
+        ...state.metrics,
+        running: state.running,
+        threadId: state.threadId,
+        activeTurnId: state.activeTurnId,
+        source: 'session_stop',
+        final: true,
+      });
       state.resetMetrics();
     }
   }

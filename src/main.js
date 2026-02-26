@@ -118,11 +118,20 @@ let micState = MIC_LISTENING;
 let muteReason = MUTE_REASON_NONE;
 let focusMode = false;
 let connectionState = CONNECTION_UNKNOWN;
+let needsReconnectRedraw = false;
 const FLOW_IDLE = 'idle';
 const FLOW_UP = 'up';
 const FLOW_DOWN = 'down';
 const FLOW_THINKING = 'thinking';
 let flowState = FLOW_IDLE;
+const reconnectStats = {
+  attempts: 0,
+  successfulReconnects: 0,
+  lastStartedAtMs: null,
+  lastSuccessLatencyMs: null,
+};
+const STOP_ACK_TIMEOUT_MS = 400;
+const stopAckWaiters = new Set();
 
 function refreshMicToggleButton() {
   if (!els.micToggleBtn) return;
@@ -141,6 +150,46 @@ function sendSessionStop(reason, source) {
     wsOpen: wsClient.isOpen(),
   });
   return sent;
+}
+
+function isStopAckMessage(msg) {
+  if (!msg || typeof msg !== 'object') return false;
+  if (msg.type === 'status') {
+    return String(msg.payload?.phase || '').trim().toLowerCase() === 'stopped';
+  }
+  if (msg.type === 'metrics') {
+    return Boolean(msg.payload?.final);
+  }
+  return false;
+}
+
+function resolveStopAckWaiters() {
+  if (!stopAckWaiters.size) return;
+  const waiters = Array.from(stopAckWaiters);
+  stopAckWaiters.clear();
+  for (const resolve of waiters) {
+    try {
+      resolve(true);
+    } catch {
+      // No-op.
+    }
+  }
+}
+
+function waitForStopAck(timeoutMs = STOP_ACK_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      stopAckWaiters.delete(onAck);
+      resolve(false);
+    }, Math.max(0, Number(timeoutMs) || 0));
+
+    const onAck = (receivedAck) => {
+      clearTimeout(timer);
+      resolve(Boolean(receivedAck));
+    };
+
+    stopAckWaiters.add(onAck);
+  });
 }
 
 function applyConnectionInputs() {
@@ -371,6 +420,42 @@ wsClient.addEventListener('open', () => {
     resumeThreadId: resumeThreadId || null,
   });
 
+  const shouldRebuildOnReconnect = needsReconnectRedraw;
+  needsReconnectRedraw = false;
+  if (shouldRebuildOnReconnect) {
+    reconnectStats.successfulReconnects += 1;
+    const now = Date.now();
+    reconnectStats.lastSuccessLatencyMs = reconnectStats.lastStartedAtMs
+      ? Math.max(0, now - reconnectStats.lastStartedAtMs)
+      : null;
+    reconnectStats.lastStartedAtMs = null;
+    logger.info('Reconnect recovered', {
+      attempts: reconnectStats.attempts,
+      successfulReconnects: reconnectStats.successfulReconnects,
+      lastSuccessLatencyMs: reconnectStats.lastSuccessLatencyMs,
+    });
+  }
+
+  if (shouldRebuildOnReconnect) {
+    void (async () => {
+      try {
+        await evenBridge.reapplyLayout();
+      } catch (error) {
+        logger.warn('Reconnect layout reapply failed', {
+          message: error?.message || String(error),
+        });
+      }
+
+      try {
+        await renderer.flushNow({ force: true });
+      } catch (error) {
+        logger.warn('Reconnect forced renderer flush failed', {
+          message: error?.message || String(error),
+        });
+      }
+    })();
+  }
+
   if (els.submitBtn) {
     els.submitBtn.disabled = false;
   }
@@ -390,6 +475,7 @@ wsClient.addEventListener('close', (event) => {
   });
   stopPingLoop();
   setConnectionState(CONNECTION_DISCONNECTED);
+  needsReconnectRedraw = true;
   markFlowIdle('ws_close');
   setStatus('Backend disconnected');
   renderer.setStatus('Backend disconnected. Reconnecting...');
@@ -404,7 +490,12 @@ wsClient.addEventListener('close', (event) => {
 
 wsClient.addEventListener('reconnecting', (event) => {
   const { attempt, delay } = event.detail;
+  reconnectStats.attempts += 1;
+  if (reconnectStats.lastStartedAtMs == null) {
+    reconnectStats.lastStartedAtMs = Date.now();
+  }
   setConnectionState(CONNECTION_RECONNECTING);
+  needsReconnectRedraw = true;
   markFlowIdle('ws_reconnecting');
   setStatus(`Reconnecting (attempt ${attempt})...`);
   renderer.setStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s`);
@@ -417,6 +508,7 @@ wsClient.addEventListener('reconnecting', (event) => {
 wsClient.addEventListener('error', (event) => {
   logger.error('WebSocket error', event.detail);
   setConnectionState(CONNECTION_ERROR);
+  needsReconnectRedraw = true;
   markFlowIdle('ws_error');
   setStatus(`WebSocket error: ${event.detail.message}`);
   renderer.setStatus(`WebSocket error: ${event.detail.message}`);
@@ -429,6 +521,9 @@ wsClient.addEventListener('error', (event) => {
 wsClient.addEventListener('message', (event) => {
   const msg = event.detail;
   if (!msg?.type) return;
+  if (isStopAckMessage(msg)) {
+    resolveStopAckWaiters();
+  }
 
   switch (msg.type) {
     case 'status': {
@@ -521,6 +616,11 @@ async function startAssistant() {
   muteReason = MUTE_REASON_NONE;
   focusMode = false;
   connectionState = CONNECTION_UNKNOWN;
+  needsReconnectRedraw = false;
+  reconnectStats.attempts = 0;
+  reconnectStats.successfulReconnects = 0;
+  reconnectStats.lastStartedAtMs = null;
+  reconnectStats.lastSuccessLatencyMs = null;
   flowState = FLOW_IDLE;
   updateRendererModeState();
 
@@ -595,7 +695,14 @@ async function stopAssistant() {
   started = false;
   markFlowIdle('stop');
 
-  sendSessionStop('user_requested_stop', 'stopAssistant');
+  const stopSent = sendSessionStop('user_requested_stop', 'stopAssistant');
+  if (stopSent) {
+    const ackReceived = await waitForStopAck(STOP_ACK_TIMEOUT_MS);
+    logger.info('Stop acknowledgement wait complete', {
+      timeoutMs: STOP_ACK_TIMEOUT_MS,
+      ackReceived,
+    });
+  }
 
   wsClient.disconnect();
   stopPingLoop();
@@ -625,6 +732,8 @@ async function stopAssistant() {
   muteReason = MUTE_REASON_NONE;
   focusMode = false;
   connectionState = CONNECTION_UNKNOWN;
+  needsReconnectRedraw = false;
+  reconnectStats.lastStartedAtMs = null;
   flowState = FLOW_IDLE;
   refreshMicToggleButton();
 
@@ -645,6 +754,7 @@ function teardownBestEffort() {
   });
 
   started = false;
+  needsReconnectRedraw = false;
   markFlowIdle('teardown');
 
   sendSessionStop('window_unload', 'beforeunload');

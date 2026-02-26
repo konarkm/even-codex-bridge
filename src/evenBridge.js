@@ -226,11 +226,12 @@ export class EvenBridgeController {
     }
   }
 
-  async updateStatus(statusText) {
+  async updateStatus(statusText, options = {}) {
     if (!this.bridge || !this.initialized) return;
 
+    const force = Boolean(options?.force);
     const content = normalizeStatusSegment(statusText, STATUS_MAX_CHARS);
-    if (content === this.lastStatusText) return;
+    if (!force && content === this.lastStatusText) return;
 
     const updatePayload = {
       containerID: STATUS_CONTAINER_ID,
@@ -252,11 +253,12 @@ export class EvenBridgeController {
     this.logger?.warn?.('status textContainerUpgrade failed after rebuild retry');
   }
 
-  async updateContent(text) {
+  async updateContent(text, options = {}) {
     if (!this.bridge || !this.initialized) return true;
 
+    const force = Boolean(options?.force);
     const content = String(text || '').slice(0, 2000);
-    if (content === this.lastContentText) {
+    if (!force && content === this.lastContentText) {
       return true;
     }
 
